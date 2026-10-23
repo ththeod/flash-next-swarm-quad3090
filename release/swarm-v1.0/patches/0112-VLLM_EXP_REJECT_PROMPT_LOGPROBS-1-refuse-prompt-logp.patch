@@ -1,0 +1,47 @@
+From aea52ed7f23e30393995a9dd53a899d334ce41e5 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 02:08:07 +0300
+Subject: [PATCH 112/138] VLLM_EXP_REJECT_PROMPT_LOGPROBS=1: refuse prompt
+ logprobs with a 400 (a 1024-token chunk of prompt logits OOMed the last PP
+ stage with the DFlash 2 drafter, W12 G1)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/sampling_params.py | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/vllm/sampling_params.py b/vllm/sampling_params.py
+index c0ab45c..adc0ab2 100644
+--- a/vllm/sampling_params.py
++++ b/vllm/sampling_params.py
+@@ -5,6 +5,7 @@
+ import copy
+ import json as json_mod
+ import math
++import os
+ from dataclasses import field
+ from enum import Enum, IntEnum
+ from functools import cached_property
+@@ -885,6 +886,19 @@ class SamplingParams(
+                     value=n,
+                 )
+ 
++        # local (2026-10-21): VLLM_EXP_REJECT_PROMPT_LOGPROBS=1 refuses prompt logprobs
++        # (also echo+logprobs) with a 400. Each 1024-token prefill chunk then materializes
++        # [1024, vocab] logits (~0.5 GB) on the last PP stage, which with the DFlash 2
++        # drafter has less free memory than that: the request OOMed the engine (W12 G1).
++        if self.prompt_logprobs is not None and os.environ.get(
++            "VLLM_EXP_REJECT_PROMPT_LOGPROBS", "0"
++        ) == "1":
++            raise VLLMValidationError(
++                "prompt_logprobs are disabled on this server (memory headroom).",
++                parameter="prompt_logprobs",
++                value=self.prompt_logprobs,
++            )
++
+         # Validate prompt logprobs.
+         if num_prompt_logprobs := self.prompt_logprobs:
+             if num_prompt_logprobs == -1:
+-- 
+2.53.0
+

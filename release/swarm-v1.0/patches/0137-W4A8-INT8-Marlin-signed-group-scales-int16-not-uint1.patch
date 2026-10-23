@@ -1,0 +1,220 @@
+From e9b66289bc21c4f808077af2fb9111a906f36c06 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 02:10:28 +0300
+Subject: [PATCH 137/138] W4A8-INT8 Marlin: signed group scales (int16, not
+ uint16) + abs-max normalization; INT8 MoE debug log
+
+Merlin-quantized checkpoints (Swift/Qwen3.8-Flash-Next) fold a sign into
+~50% of the group scales. marlin_act_int8_process_scales normalized by the
+max (not abs max) and the INT8 kernels read the int16 scales as uint16, so
+every negative scale became ~65K: ~20,000x error, garbage output (W45/W46).
+Read them as int16 in the MoE and dense Marlin templates (needs a rebuilt
+_moe_C; the in-tree .so is rebuilt for sm_80/86, prebuilt kept as
+*.prebuilt) and normalize by the absolute maximum.
+
+Also VLLM_E2_INT8_MOE_DEBUG=N: log inputs, scales and outputs of the first N
+non-zero prefill-sized MarlinExperts calls per process (default off).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../moe/marlin_moe_wna16/marlin_template.h    |  8 +--
+ .../quantization/marlin/marlin_template.h     |  8 +--
+ .../moe/test_marlin_moe_int8_signed_scales.py | 72 +++++++++++++++++++
+ .../layers/fused_moe/experts/marlin_moe.py    | 28 ++++++++
+ .../layers/quantization/utils/marlin_utils.py |  8 ++-
+ 5 files changed, 114 insertions(+), 10 deletions(-)
+ create mode 100644 tests/kernels/moe/test_marlin_moe_int8_signed_scales.py
+
+diff --git a/csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h b/csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h
+index d552679..bb5aab3 100644
+--- a/csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h
++++ b/csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h
+@@ -1262,11 +1262,11 @@ __global__ void Marlin(
+           if constexpr (a_type == vllm::kS8) {
+             int2 s_vals[2];
+             s_vals[0] = {
+-                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[0],
+-                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[1]};
++                (int)reinterpret_cast<int16_t*>(&frag_s[k2][j * 2][0])[0],
++                (int)reinterpret_cast<int16_t*>(&frag_s[k2][j * 2][0])[1]};
+             s_vals[1] = {
+-                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2 + 1][0])[0],
+-                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2 + 1][0])[1]};
++                (int)reinterpret_cast<int16_t*>(&frag_s[k2][j * 2 + 1][0])[0],
++                (int)reinterpret_cast<int16_t*>(&frag_s[k2][j * 2 + 1][0])[1]};
+ 
+   #pragma unroll
+             for (int i = 0; i < thread_m_blocks; i++) {
+diff --git a/csrc/libtorch_stable/quantization/marlin/marlin_template.h b/csrc/libtorch_stable/quantization/marlin/marlin_template.h
+index 962f15c..98f6f60 100644
+--- a/csrc/libtorch_stable/quantization/marlin/marlin_template.h
++++ b/csrc/libtorch_stable/quantization/marlin/marlin_template.h
+@@ -1129,11 +1129,11 @@ __global__ void Marlin(
+           if constexpr (a_type == vllm::kS8) {
+             int2 s_vals[2];
+             s_vals[0] = {
+-                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[0],
+-                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[1]};
++                (int)reinterpret_cast<int16_t*>(&frag_s[k2][j * 2][0])[0],
++                (int)reinterpret_cast<int16_t*>(&frag_s[k2][j * 2][0])[1]};
+             s_vals[1] = {
+-                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2 + 1][0])[0],
+-                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2 + 1][0])[1]};
++                (int)reinterpret_cast<int16_t*>(&frag_s[k2][j * 2 + 1][0])[0],
++                (int)reinterpret_cast<int16_t*>(&frag_s[k2][j * 2 + 1][0])[1]};
+ 
+   #pragma unroll
+             for (int i = 0; i < thread_m_blocks; i++) {
+diff --git a/tests/kernels/moe/test_marlin_moe_int8_signed_scales.py b/tests/kernels/moe/test_marlin_moe_int8_signed_scales.py
+new file mode 100644
+index 0000000..5672e91
+--- /dev/null
++++ b/tests/kernels/moe/test_marlin_moe_int8_signed_scales.py
+@@ -0,0 +1,72 @@
++# SPDX-License-Identifier: Apache-2.0
++"""W4A8-INT8 Marlin MoE with SIGNED group scales (local 2026-10-23, W47).
++
++Merlin-quantized checkpoints fold a sign into ~half of the group scales. The INT8 kernel used to read the
++int16-normalized scales as uint16, which turned every negative scale into ~65K (~20,000x error, garbage output).
++Exercises the load-time path: GPTQ-packed weights -> oracle _process_weights_marlin(int8) -> fused_marlin_moe with the
++INT8 global activation scales, against a torch reference on the dequantized weights.
++"""
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from tests.kernels.utils import torch_experts
++from vllm.config import VllmConfig, set_current_vllm_config
++from vllm.model_executor.layers.fused_moe import fused_topk
++from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
++from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import _process_weights_marlin
++from vllm.model_executor.layers.quantization.utils.quant_utils import gptq_pack, quantize_weights
++from vllm.scalar_type import scalar_types
++
++G = 128
++QT = scalar_types.uint4b8
++
++
++def _ct_pack(w, signed):
++    refs, qs, ss = [], [], []
++    for i in range(w.shape[0]):
++        w_ref, q_w, s = quantize_weights(w[i].T.contiguous(), QT, G)[:3]
++        if signed:
++            m = torch.where(torch.rand_like(s.float()) < 0.5, -1.0, 1.0).to(s.dtype)
++            s = s * m
++            w_ref = w_ref * m.repeat_interleave(G, dim=0)
++        qs.append(gptq_pack(q_w, 4, q_w.shape[0], q_w.shape[1]))
++        ss.append(s)
++        refs.append(w_ref.T)
++    return torch.stack(refs), torch.stack(qs), torch.stack(ss)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
++@pytest.mark.parametrize("signed", [False, True])
++@pytest.mark.parametrize("int8", [False, True])
++@pytest.mark.parametrize("m,ep", [(256, 1), (256, 2), (8, 2)])
++def test_marlin_moe_signed_scales(signed, int8, m, ep):
++    torch.manual_seed(2)
++    n, k, e, topk, dtype = 640, 2560, 16, 4, torch.bfloat16
++    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
++    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
++    w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
++    e_map = None
++    if ep > 1:
++        le = e // ep
++        ids = torch.randperm(e, device="cuda", dtype=torch.int32)[:le]
++        e_map = torch.full((e,), -1, device="cuda", dtype=torch.int32)
++        e_map[ids] = torch.arange(le, device="cuda", dtype=torch.int32)
++        w1, w2 = w1[ids], w2[ids]
++    r1, p1, s1 = _ct_pack(w1, signed)
++    r2, p2, s2 = _ct_pack(w2, signed)
++    layer = SimpleNamespace(intermediate_size_per_partition=n, num_groups_w13=k // G, num_groups_w2=n // G)
++    in_dt = torch.int8 if int8 else None
++    q1, q2, ms1, ms2, _, _, g1, g2, _, _ = _process_weights_marlin(layer, in_dt, 4, 8, G, p1, p2, s1, s2)
++    score = torch.randn((m, e), device="cuda", dtype=dtype)
++    tw, tid, _ = fused_topk(a, score, topk, False)
++    with set_current_vllm_config(VllmConfig()):
++        sc = torch.softmax(score, dim=-1, dtype=torch.float32)
++        tw2, tid2 = torch.topk(sc, topk)
++        ref = torch_experts(a, r1, r2, topk_weight=tw2, topk_ids=tid2, global_num_experts=e, expert_map=e_map,
++                            quant_dtype=in_dt, per_act_token_quant=int8)
++        out = fused_marlin_moe(a, q1, q2, None, None, ms1, ms2, tw, tid, global_num_experts=e, expert_map=e_map,
++                               input_global_scale1=g1, input_global_scale2=g2, input_dtype=in_dt, quant_type_id=QT.id)
++    rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
++    assert rel < 0.05, rel
+diff --git a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+index 7fa6c6f..37184d0 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+@@ -58,6 +58,15 @@ from vllm.platforms import current_platform
+ from vllm.scalar_type import ScalarType, scalar_types
+ 
+ 
++import os as _os
++
++from vllm.logger import init_logger as _e2_init_logger
++
++# Debug (W47, INT8 MoE): log inputs/scales/outputs of the first N prefill-sized MarlinExperts calls per process.
++_e2_logger = _e2_init_logger(__name__)
++_E2_INT8_DBG = [int(_os.environ.get("VLLM_E2_INT8_MOE_DEBUG", "0") or 0)]
++
++
+ def _fused_marlin_moe(
+     hidden_states: torch.Tensor,
+     w1: torch.Tensor,
+@@ -714,6 +723,21 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
+         assert self.w2_scale is not None
+ 
+         ctx = self._lora_context
++        _dbg = (_E2_INT8_DBG[0] > 0 and hidden_states.size(0) >= 16
++                and bool(hidden_states.abs().amax() > 0))  # skip warm-up / profiling passes (all-zero input)
++        if _dbg:
++            _E2_INT8_DBG[0] -= 1
++            _s1 = self.w1_scale
++            _e2_logger.warning(
++                "E2-INT8-DBG in: x %s %s absmax %.4g | input_dtype %s | a1_gscale %s a2_gscale %s | "
++                "w1 %s %s w2 %s | w1_scale %s %s first int16 %s | quant_type %s | expert_map %s | act %s",
++                hidden_states.dtype, tuple(hidden_states.shape), hidden_states.float().abs().max().item(),
++                self.input_dtype,
++                None if self.a1_gscale is None else self.a1_gscale.float().flatten()[:2].tolist(),
++                None if self.a2_gscale is None else self.a2_gscale.float().flatten()[:2].tolist(),
++                w1.dtype, tuple(w1.shape), tuple(w2.shape), _s1.dtype, tuple(_s1.shape),
++                _s1.view(torch.int16).flatten()[:6].tolist() if _s1.element_size() == 2 else None,
++                self.quant_type_id, None if expert_map is None else int((expert_map >= 0).sum()), activation)
+         if ctx is None:
+             fused_marlin_moe(
+                 hidden_states=hidden_states,
+@@ -746,6 +770,10 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
+                 intermediate_cache2=workspace13,
+                 input_dtype=self.input_dtype,
+             )
++            if _dbg:
++                _e2_logger.warning("E2-INT8-DBG out: absmax %.4g mean|.| %.4g nan %d",
++                                   output.float().abs().max().item(), output.float().abs().mean().item(),
++                                   int(torch.isnan(output).sum()))
+             return
+ 
+         # LoRA path: wrap activation_func and moe_sum to inject LoRA at the
+diff --git a/vllm/model_executor/layers/quantization/utils/marlin_utils.py b/vllm/model_executor/layers/quantization/utils/marlin_utils.py
+index 22cf18f..9deb452 100644
+--- a/vllm/model_executor/layers/quantization/utils/marlin_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/marlin_utils.py
+@@ -475,8 +475,12 @@ def marlin_permute_bias(s: torch.Tensor) -> torch.Tensor:
+ 
+ 
+ def marlin_act_int8_process_scales(s: torch.Tensor):
+-    a_scales_scale_factor = 1 / 4096 * s.max().float()
+-    s = s / s.max() * 4096
++    # Normalize by the absolute maximum: some checkpoints (e.g. Merlin-quantized
++    # Swift/Qwen3.8 experts) fold a sign into ~half of the group scales, and the
++    # INT8 kernel now reads these int16 scales as signed (local fix, W47).
++    s_absmax = s.abs().max()
++    a_scales_scale_factor = 1 / 4096 * s_absmax.float()
++    s = s / s_absmax * 4096
+     s = s.round().to(torch.int16).view(s.dtype)
+     return s, a_scales_scale_factor
+ 
+-- 
+2.53.0
+

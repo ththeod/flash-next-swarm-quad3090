@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-label="flash-next-swarm-quad3090: Swift 1.5 on 4x RTX 3090. Generation 1,144 tok/s at 16 requests; prefill 8,490 tok/s on a 50K prompt; 1.21M-token KV cache plus a RAM tier; 26.6 turns per minute with 40 agents.">
+<rect width="1200" height="300" rx="16" fill="#1a1a19"/>
+<rect x="0.5" y="0.5" width="1199" height="299" rx="16" fill="none" stroke="rgba(255,255,255,0.10)"/>
+<text x="48" y="70" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="34" font-weight="650" fill="#f0efec">flash-next-swarm-quad3090</text>
+<text x="48" y="104" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="19" fill="#c3c2b7">Swift 1.5 (Qwen3.8-Flash-Next, 125B MoE) on four RTX 3090s, tuned for coding-agent swarms</text>
+<rect x="48" y="122" width="56" height="3" rx="1.5" fill="#3987e5"/>
+<rect x="48" y="150" width="258" height="112" rx="12" fill="#222221"/>
+<text x="68" y="182" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#c3c2b7">Generation, 16 requests</text>
+<text x="68" y="230" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="44" font-weight="650" fill="#f0efec">1,144</text>
+<text x="68" y="252" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="14" fill="#898781">tok/s</text>
+<rect x="326" y="150" width="258" height="112" rx="12" fill="#222221"/>
+<text x="346" y="182" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#c3c2b7">Prefill, 50K-token prompt</text>
+<text x="346" y="230" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="44" font-weight="650" fill="#f0efec">8,490</text>
+<text x="346" y="252" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="14" fill="#898781">tok/s</text>
+<rect x="604" y="150" width="258" height="112" rx="12" fill="#222221"/>
+<text x="624" y="182" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#c3c2b7">KV cache in VRAM</text>
+<text x="624" y="230" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="44" font-weight="650" fill="#f0efec">1.21M</text>
+<text x="624" y="252" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="14" fill="#898781">tokens + RAM tier</text>
+<rect x="882" y="150" width="258" height="112" rx="12" fill="#222221"/>
+<text x="902" y="182" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#c3c2b7">40-agent swarm</text>
+<text x="902" y="230" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="44" font-weight="650" fill="#f0efec">26.6</text>
+<text x="902" y="252" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="14" fill="#898781">turns per minute</text>
+</svg>

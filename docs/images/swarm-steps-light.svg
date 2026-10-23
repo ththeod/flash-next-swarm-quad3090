@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="430" viewBox="0 0 1200 430" role="img" aria-label="Bar chart: 40-agent swarm, completed turns per minute after each step: RAM tier + DFlash 2 + sm_86 kernels 15.94; RAM-tier and scheduling fixes 23.13; FP4 attention KV 23.34; INT8 MoE activations + BF16 unlock 24.24; NCCL LL/Simple protocols 25.73; FlashInfer PCIe all-reduce 26.63.">
+<rect width="1200" height="430" rx="16" fill="#fcfcfb"/>
+<rect x="0.5" y="0.5" width="1199" height="429" rx="16" fill="none" stroke="rgba(11,11,11,0.10)"/>
+<text x="48" y="58" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="22" font-weight="650" fill="#0b0b0b">40-agent swarm: completed turns per minute, step by step</text>
+<text x="48" y="86" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">40 agents with ~100K-token contexts for 20 minutes, same benchmark at every step; the BF16 unlock arrived at the INT8 step</text>
+<line x1="360.0" y1="112" x2="360.0" y2="382" stroke="#c3c2b7" stroke-width="1"/>
+<text x="360.0" y="404" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">0</text>
+<line x1="610.0" y1="112" x2="610.0" y2="382" stroke="#e1e0d9" stroke-width="1"/>
+<text x="610.0" y="404" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">10</text>
+<line x1="860.0" y1="112" x2="860.0" y2="382" stroke="#e1e0d9" stroke-width="1"/>
+<text x="860.0" y="404" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">20</text>
+<line x1="1110.0" y1="112" x2="1110.0" y2="382" stroke="#e1e0d9" stroke-width="1"/>
+<text x="1110.0" y="404" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">30</text>
+<path d="M360,129.0 H754.5 Q758.5,129.0 758.5,133.0 V147.0 Q758.5,151.0 754.5,151.0 H360 Z" fill="#2a78d6"><title>RAM tier + DFlash 2 + sm_86 kernels: 15.94 turns/min</title></path>
+<text x="346" y="145.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">RAM tier + DFlash 2 + sm_86 kernels</text>
+<text x="768.5" y="145.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">15.9</text>
+<path d="M360,173.0 H934.2 Q938.2,173.0 938.2,177.0 V191.0 Q938.2,195.0 934.2,195.0 H360 Z" fill="#2a78d6"><title>RAM-tier and scheduling fixes: 23.13 turns/min</title></path>
+<text x="346" y="189.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">RAM-tier and scheduling fixes</text>
+<text x="948.2" y="189.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">23.1</text>
+<path d="M360,217.0 H939.5 Q943.5,217.0 943.5,221.0 V235.0 Q943.5,239.0 939.5,239.0 H360 Z" fill="#2a78d6"><title>FP4 attention KV: 23.34 turns/min</title></path>
+<text x="346" y="233.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">FP4 attention KV</text>
+<text x="953.5" y="233.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">23.3</text>
+<path d="M360,261.0 H962.0 Q966.0,261.0 966.0,265.0 V279.0 Q966.0,283.0 962.0,283.0 H360 Z" fill="#2a78d6"><title>INT8 MoE activations + BF16 unlock: 24.24 turns/min</title></path>
+<text x="346" y="277.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">INT8 MoE activations + BF16 unlock</text>
+<text x="976.0" y="277.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">24.2</text>
+<path d="M360,305.0 H999.2 Q1003.2,305.0 1003.2,309.0 V323.0 Q1003.2,327.0 999.2,327.0 H360 Z" fill="#2a78d6"><title>NCCL LL/Simple protocols: 25.73 turns/min</title></path>
+<text x="346" y="321.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">NCCL LL/Simple protocols</text>
+<text x="1013.2" y="321.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">25.7</text>
+<path d="M360,349.0 H1021.8 Q1025.8,349.0 1025.8,353.0 V367.0 Q1025.8,371.0 1021.8,371.0 H360 Z" fill="#2a78d6"><title>FlashInfer PCIe all-reduce: 26.63 turns/min</title></path>
+<text x="346" y="365.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">FlashInfer PCIe all-reduce</text>
+<text x="1035.8" y="365.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">26.6</text>
+<text x="735" y="430" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">turns per minute</text>
+</svg>

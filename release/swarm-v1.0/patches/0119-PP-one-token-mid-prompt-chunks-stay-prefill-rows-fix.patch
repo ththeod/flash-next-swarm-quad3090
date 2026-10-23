@@ -1,0 +1,122 @@
+From 3816e59d73d2b75f8c886ce119cc5d7c13b93318 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 16:27:37 +0300
+Subject: [PATCH 119/138] PP: one-token mid-prompt chunks stay prefill rows
+ (fixes 'deferred model state for a step without sampled outputs')
+
+The one-token prompt-tail port (c64a07f, upstream #58400) also ran one-token
+mid-prompt chunks as decodes. Under RecoverSSM such a row takes the spec
+path, but it samples nothing: its state commit gets num_sampled 0 (commit
+length 0, so the token never enters the GDN/conv state), and on a non-last
+PP rank a step made only of non-sampling rows records a commit while
+receive() reserves no slot -> attach_deferred_state raises and the engine
+fails closed (production 2026-10-21 16:09:33). Mamba align mode with
+4096-token blocks and a 1024-token budget reaches such chunks when the
+chunk before a block boundary ends one token short.
+
+Only prompt tails (the chunk that completes the prompt) now run as decode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/v1/worker/test_gpu_batch_ordering.py | 48 ++++++++++++++++++++--
+ vllm/v1/worker/gpu/model_runner.py         | 10 ++++-
+ 2 files changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_batch_ordering.py b/tests/v1/worker/test_gpu_batch_ordering.py
+index db9e080..e214842 100644
+--- a/tests/v1/worker/test_gpu_batch_ordering.py
++++ b/tests/v1/worker/test_gpu_batch_ordering.py
+@@ -130,9 +130,10 @@ def test_prompt_chunk_of_decode_query_len_is_not_uniform_decode():
+ 
+ 
+ def test_one_new_prompt_token_over_context_runs_as_decode():
+-    # A prompt tail padded with placeholder drafts and a one-token mid-prompt
+-    # chunk both compute like decodes. A fresh one-token prompt and a real
+-    # multi-token chunk don't.
++    # A prompt tail padded with placeholder drafts computes like a decode. A
++    # one-token mid-prompt chunk samples nothing, so it stays a prefill row (a
++    # decode row's recurrent state is committed with its sampled count). A
++    # fresh one-token prompt and a real multi-token chunk don't either.
+     batch = {"d0": (16, 16), "tail": (128, 129), "mid": (64, 129)}
+     batch.update({"fresh": (0, 1), "chunk": (120, 129)})
+     runner = _make_runner(batch, decode_query_len=4)
+@@ -147,12 +148,51 @@ def test_one_new_prompt_token_over_context_runs_as_decode():
+     assert runs_as_decode == {
+         "d0": False,
+         "tail": True,
+-        "mid": True,
++        "mid": False,
+         "fresh": False,
+         "chunk": False,
+     }
+ 
+ 
++def test_rows_run_as_decode_all_produce_a_sample():
++    # Every row on the decode (RecoverSSM spec) path must produce a sample: its
++    # state commit uses the sampled count, and a non-last PP rank only keeps a
++    # deferred commit for steps that receive sampled tokens. A step of only a
++    # 1023-token chunk and a 1-token mid-prompt chunk (2026-10-21 PP crash) or a
++    # lone 1-token chunk at an alignment stop must have no decode rows.
++    from vllm.v1.attention.backends.recoverssm_metadata import recoverssm_spec_rows
++
++    cases = [
++        ({"a": (0, 5000), "b": (1024, 3000)}, {"a": 1023, "b": 1}),
++        ({"b": (2047, 9000)}, {"b": 1}),
++        ({"d0": (500, 400), "b": (1024, 3000)}, {"d0": 1, "b": 1}),
++        ({"d0": (16, 16), "tail": (128, 129)}, {"d0": 1, "tail": 1}),
++    ]
++    for batch, sched in cases:
++        runner = _make_runner(batch, decode_query_len=1)
++        scheduler_output = SimpleNamespace(
++            num_scheduled_tokens=sched,
++            total_num_scheduled_tokens=sum(sched.values()),
++            scheduled_spec_decode_tokens={},
++        )
++        state, _ = runner.gather_batch_req_state(scheduler_output, False)
++        is_prefilling = state.is_prefilling_np.copy()
++        if state.prefill_runs_as_decode_np is not None:
++            is_prefilling &= ~state.prefill_runs_as_decode_np
++        num_reqs = len(state.req_ids)
++        query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32)
++        query_start_loc[1:] = torch.from_numpy(np.cumsum(state.num_scheduled_tokens))
++        _, rows = recoverssm_spec_rows(
++            torch.from_numpy(is_prefilling),
++            query_start_loc,
++            torch.full((num_reqs,), -1, dtype=torch.int32),
++            num_reqs,
++        )
++        computed = np.array([batch[r][0] for r in state.req_ids])
++        samples = computed + state.num_scheduled_tokens >= state.prefill_len_np
++        assert all(samples[i] for i in rows.tolist()), (batch, sched)
++
++
+ def test_one_token_prompt_tail_with_prior_context_is_uniform_decode():
+     # Replaying the last prompt token over existing context (full prefix-cache
+     # hit or P/D KV import) computes exactly like a decode.
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 0817b62..8116c21 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1372,10 +1372,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         if has_prefill and self.pcp_manager is None:
+             # One new prompt token over existing context (possibly padded with
+             # placeholder drafts) runs as a decode. PCP partitions prefill rows.
++            # Only a prompt tail: a decode row's recurrent state is committed
++            # with its sampled count, and a mid-prompt chunk samples nothing
++            # (RecoverSSM would commit 0 tokens, and a PP step of such rows
++            # carries a commit without a sampled-token broadcast).
+             num_new_tokens = num_scheduled_tokens
+             if num_draft_tokens_np is not None:
+                 num_new_tokens = num_new_tokens - num_draft_tokens_np
+-            one_token_ext = (num_new_tokens == 1) & (num_computed_prefill_tokens_np > 0)
++            one_token_ext = (
++                (num_new_tokens == 1)
++                & (num_computed_prefill_tokens_np > 0)
++                & (num_computed_prefill_tokens_np + 1 >= prefill_len_np)
++            )
+             prefill_runs_as_decode_np = is_prefilling_np & one_token_ext
+             decode_graph_eligible = bool(
+                 (prefill_runs_as_decode_np | ~is_prefilling_np).all()
+-- 
+2.53.0
+

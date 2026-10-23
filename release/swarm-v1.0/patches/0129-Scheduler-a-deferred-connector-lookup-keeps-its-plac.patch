@@ -1,0 +1,136 @@
+From ba54bace01fb6ff80001f8bd2bb68593ca6b661a Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 15:40:54 +0300
+Subject: [PATCH 129/138] Scheduler: a deferred connector lookup keeps its
+ place in the waiting queue
+
+A request whose KV connector lookup returned None (e.g. the offloading
+connector defers while a needed chunk is being loaded) joined
+skipped_waiting, which FCFS serves before waiting. One deferral thus put a
+request ahead of every older one, and a capacity-blocked head there kept
+waiting (fresh and preempted requests) from being examined at all. Deferred
+requests now go back to the front of waiting in arrival order; they are
+still reported as deferred in the scheduler stats.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/v1/core/test_scheduler.py | 36 +++++++++++++++++++++++++++++++++
+ vllm/v1/core/sched/scheduler.py | 24 +++++++++++++++++++---
+ 2 files changed, 57 insertions(+), 3 deletions(-)
+
+diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
+index 07ced9e..c316d88 100644
+--- a/tests/v1/core/test_scheduler.py
++++ b/tests/v1/core/test_scheduler.py
+@@ -1336,6 +1336,42 @@ def test_prefix_cache_query_not_inflated_by_connector_defer():
+     assert stats.queries == request.num_tokens
+ 
+ 
++def test_deferred_lookup_keeps_arrival_order():
++    """(local 2026-10-22) A request whose connector lookup was deferred keeps its
++    place in `waiting`. It used to join `skipped_waiting`, which FCFS serves
++    first, so it went ahead of an older request preempted meanwhile: here the
++    newer request took the free blocks and the older one did not fit."""
++    scheduler = create_scheduler(
++        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
++        num_blocks=6,
++        block_size=16,
++    )
++    older = create_requests(
++        num_requests=1, num_tokens=32, block_size=16, req_ids=["older"]
++    )[0]
++    newer = create_requests(
++        num_requests=1, num_tokens=64, block_size=16, req_ids=["newer"]
++    )[0]
++
++    scheduler.add_request(older)
++    assert older.request_id in scheduler.schedule().num_scheduled_tokens
++
++    scheduler.connector._defers_left[newer.request_id] = 1
++    scheduler.add_request(newer)
++    assert newer.request_id not in scheduler.schedule().num_scheduled_tokens
++    assert newer in scheduler.waiting and newer not in scheduler.skipped_waiting
++    assert scheduler.make_stats().num_skipped_waiting_reqs == 1
++
++    scheduler.running.remove(older)
++    # (its in-flight output is dropped, so it may resume right away)
++    scheduler._preempt_request(older, 0.0, drop_stale_output=True)
++    assert list(scheduler.waiting) == [older, newer]
++
++    scheduled = scheduler.schedule().num_scheduled_tokens
++    assert older.request_id in scheduled
++    assert newer.request_id not in scheduled
++
++
+ def test_preemption_re_records_prefix_cache_query():
+     """A preempted request re-enters the lookup on resume, so its recomputation
+     is counted again into the preempted stats."""
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 2ad6f1c..3e60c91 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -231,6 +231,9 @@ class Scheduler(SchedulerInterface):
+         self.waiting = create_request_queue(self.policy)
+         # requests skipped in waiting flow due async deps or constraints.
+         self.skipped_waiting = create_request_queue(self.policy)
++        # (local 2026-10-22) requests whose connector lookup was deferred in the
++        # last pass; they stay in `waiting` in arrival order (stats only).
++        self._num_deferred_waiting = 0
+         self.running: list[Request] = []
+ 
+         # The request IDs that are finished in between the previous and the
+@@ -954,6 +957,7 @@ class Scheduler(SchedulerInterface):
+         # Next, schedule the WAITING requests.
+         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+             step_skipped_waiting = create_request_queue(self.policy)
++            step_deferred_waiting = create_request_queue(self.policy)
+ 
+             while (self.waiting or self.skipped_waiting) and token_budget > 0:
+                 if input_budget <= draft_slots:
+@@ -1043,8 +1047,16 @@ class Scheduler(SchedulerInterface):
+                             # The request cannot be scheduled because
+                             # the KVConnector couldn't determine
+                             # the number of matched tokens.
++                            # (local 2026-10-22) It keeps its place in `waiting`
++                            # (re-queued below) instead of joining
++                            # `skipped_waiting`, which FCFS serves first: one
++                            # deferral used to put a request ahead of every
++                            # older one there, and a capacity-blocked head in
++                            # `skipped_waiting` then starved `waiting` (a
++                            # preempted or fresh request waited 30+ min under
++                            # a 40-agent load while later turns were served).
+                             request_queue.pop_request()
+-                            step_skipped_waiting.prepend_request(request)
++                            step_deferred_waiting.prepend_request(request)
+                             continue
+ 
+                         if partial_tail and ext_tokens > partial_tail:
+@@ -1493,6 +1505,10 @@ class Scheduler(SchedulerInterface):
+             # re-queue requests skipped in this pass ahead of older skipped items.
+             if step_skipped_waiting:
+                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
++            # deferred lookups go back to the front of `waiting`, in order.
++            self._num_deferred_waiting = len(step_deferred_waiting)
++            if step_deferred_waiting:
++                self.waiting.prepend_requests(step_deferred_waiting)
+ 
+             # Whoever is still waiting keeps its prefix-cache hit.
+             self._pin_waiting_hits()
+@@ -3050,10 +3066,12 @@ class Scheduler(SchedulerInterface):
+         connector_stats_payload = (
+             kv_connector_stats.to_dict() if kv_connector_stats else None
+         )
++        # deferred lookups wait in `waiting`; still reported as "deferred".
++        num_deferred = min(self._num_deferred_waiting, len(self.waiting))
+         return SchedulerStats(
+             num_running_reqs=len(self.running),
+-            num_waiting_reqs=len(self.waiting),
+-            num_skipped_waiting_reqs=len(self.skipped_waiting),
++            num_waiting_reqs=len(self.waiting) - num_deferred,
++            num_skipped_waiting_reqs=len(self.skipped_waiting) + num_deferred,
+             kv_cache_usage=self.kv_cache_manager.usage,
+             prefix_cache_stats=prefix_cache_stats,
+             connector_prefix_cache_stats=connector_prefix_cache_stats,
+-- 
+2.53.0
+

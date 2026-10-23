@@ -1,0 +1,427 @@
+From e63fa243820b362045e583fe6cbbb45b879dc595 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:34:40 +0300
+Subject: [PATCH 106/138] fp4: real FP4 QSA main-KV storage
+ (VLLM_EXP_QSA_KV_FP4): Triton writer, KV_DTYPE=3 reader branch, 144-byte
+ rows, warm-up
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../warmup/qwen4_exp_qsa_warmup.py            |   4 +
+ vllm/models/qwen4_exp/nvidia/ops/qsa.py       | 228 +++++++++++++++++-
+ vllm/models/qwen4_exp/nvidia/qsa.py           |  51 +++-
+ 3 files changed, 268 insertions(+), 15 deletions(-)
+
+diff --git a/vllm/model_executor/warmup/qwen4_exp_qsa_warmup.py b/vllm/model_executor/warmup/qwen4_exp_qsa_warmup.py
+index 3cbc3bf..9299bf1 100644
+--- a/vllm/model_executor/warmup/qwen4_exp_qsa_warmup.py
++++ b/vllm/model_executor/warmup/qwen4_exp_qsa_warmup.py
+@@ -77,11 +77,15 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
+ 
+     kv_cache = owner.kv_cache
+     assert kv_cache.numel()
++    from vllm.models.qwen4_exp.nvidia.qsa import _QSA_KV_FP4
++
+     attention_profiles = warmup_qsa_sparse_paged_attention(
+         kv_cache,
+         block_table_for(owner.layer_name),
+         num_query_heads=owner.num_heads,
+         selection_width=indexer.output_width,
++        kv_fp4=_QSA_KV_FP4,
++        fp4_head_dim=owner.head_dim,
+     )
+     logger.info(
+         "Warmed up Qwen4Exp QSA sparse attention kernels: %s.",
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index 2acc6f4..52ba062 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -35,6 +35,162 @@ def _decode_e4m3_to_bf16(b):
+     return (bits.to(tl.uint16).to(tl.float16, bitcast=True) * 256.0).to(tl.bfloat16)
+ 
+ 
++# --- local experiment: FP4 main K/V storage (VLLM_EXP_QSA_KV_FP4) -------------
++# DeepSeek-V4.1-style main KV: E2M1 values with one E4M3 scale per 16 elements of
++# head_dim, no global scale. Each K or V row of a (token, kv head) is
++# [head_dim/2 packed bytes: element 2i in the low nibble, 2i+1 in the high]
++# [head_dim/16 E4M3 scale bytes], i.e. 144 B for head_dim 256 (FP8: 256 B).
++QSA_FP4_GROUP = 16
++
++
++def qsa_fp4_row_bytes(head_dim: int) -> int:
++    return head_dim // 2 + head_dim // QSA_FP4_GROUP
++
++
++_unit_scales: dict[torch.device, torch.Tensor] = {}
++
++
++def _unit_scale(device: torch.device) -> torch.Tensor:
++    """Persistent float32 1.0 on `device` (allocated on first use, i.e. in the eager
++    warm-up/profile run, never inside CUDA graph capture)."""
++    t = _unit_scales.get(device)
++    if t is None:
++        t = torch.ones((), dtype=torch.float32, device=device)
++        _unit_scales[device] = t
++    return t
++
++
++@triton.jit
++def _encode_e4m3(x):
++    """fp32 >= 0 -> E4M3 byte, round half up on the dropped mantissa bit,
++    saturating at 448 (0x7E); never emits the NaN codes 0x7F/0xFF."""
++    x = tl.minimum(tl.maximum(x, 0.0), 448.0)
++    bits = x.to(tl.int32, bitcast=True)
++    exp = ((bits >> 23) & 0xFF) - 127
++    mant = bits & 0x7FFFFF
++    m = (mant >> 20) + ((mant >> 19) & 1)
++    exp_n = tl.where(m == 8, exp + 1, exp)
++    m = tl.where(m == 8, 0, m)
++    normal = tl.minimum(((exp_n + 7) << 3) | m, 0x7E)
++    # Below 2^-6 E4M3 is subnormal: multiples of 2^-9 (8 rounds to the first
++    # normal, code 0x08 = 2^-6, by construction).
++    sub = tl.floor(x * 512.0 + 0.5).to(tl.int32)
++    return tl.where(exp < -6, sub, normal).to(tl.uint8)
++
++
++@triton.jit
++def _decode_e2m1(nib):
++    """4-bit E2M1 code (sign bit 3) -> fp32 in {0, .5, 1, 1.5, 2, 3, 4, 6} x sign."""
++    code = nib & 7
++    e = code >> 1
++    m = (code & 1).to(tl.float32)
++    mag = tl.where(e == 0, m * 0.5, tl.exp2((e - 1).to(tl.float32)) * (1.0 + 0.5 * m))
++    return tl.where((nib & 8) != 0, -mag, mag)
++
++
++@triton.jit
++def _fp4_quantize_row(x, HEAD_DIM: tl.constexpr):
++    """[HEAD_DIM] fp32 -> ([HEAD_DIM/2] packed uint8, [HEAD_DIM/16] E4M3 scales)."""
++    g = tl.reshape(x, (HEAD_DIM // 16, 16))
++    amax = tl.max(tl.abs(g), axis=1)
++    scale_code = _encode_e4m3(amax / 6.0)
++    scale = _decode_e4m3_to_bf16(scale_code).to(tl.float32)
++    scale = tl.where(scale > 0.0, scale, 1.0)
++    v = g / scale[:, None]
++    a = tl.abs(v)
++    # Nearest E2M1 magnitude (midpoints; ties go down, like the fake-quant test).
++    code = (
++        (a > 0.25).to(tl.int32) + (a > 0.75).to(tl.int32) + (a > 1.25).to(tl.int32)
++        + (a > 1.75).to(tl.int32) + (a > 2.5).to(tl.int32) + (a > 3.5).to(tl.int32)
++        + (a > 5.0).to(tl.int32)
++    )
++    nib = code | (((v < 0.0) & (code > 0)).to(tl.int32) << 3)
++    lo, hi = tl.split(tl.reshape(nib, (HEAD_DIM // 2, 2)))
++    return (lo | (hi << 4)).to(tl.uint8), scale_code
++
++
++@triton.jit
++def _qsa_fp4_store_kernel(
++    key_ptr,
++    value_ptr,
++    cache_ptr,
++    slot_ptr,
++    stride_key_token,
++    stride_key_head,
++    stride_value_token,
++    stride_value_head,
++    stride_cache_block,
++    stride_cache_head,
++    stride_cache_token,
++    PAGE_SIZE: tl.constexpr,
++    HEAD_DIM: tl.constexpr,
++    ROW_BYTES: tl.constexpr,
++):
++    token = tl.program_id(0)
++    head = tl.program_id(1)
++    slot = tl.load(slot_ptr + token).to(tl.int64)
++    if slot < 0:  # padding rows of a captured batch, like reshape_and_cache_flash
++        return
++    block = slot // PAGE_SIZE
++    offset = slot % PAGE_SIZE
++    base = (
++        cache_ptr
++        + block * stride_cache_block
++        + head * stride_cache_head
++        + offset * stride_cache_token
++    )
++    dims = tl.arange(0, HEAD_DIM)
++    for kv in tl.static_range(2):
++        if kv == 0:
++            x = tl.load(key_ptr + token * stride_key_token + head * stride_key_head + dims)
++        else:
++            x = tl.load(
++                value_ptr + token * stride_value_token + head * stride_value_head + dims
++            )
++        packed, scales = _fp4_quantize_row(x.to(tl.float32), HEAD_DIM)
++        row = base + kv * ROW_BYTES
++        tl.store(row + tl.arange(0, HEAD_DIM // 2), packed)
++        tl.store(row + HEAD_DIM // 2 + tl.arange(0, HEAD_DIM // 16), scales)
++
++
++def qsa_fp4_store_kv(
++    key: torch.Tensor,
++    value: torch.Tensor,
++    kv_cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++) -> None:
++    """Write K/V rows ([T, H, D] BF16) into an FP4 (B, H, N, 2*row_bytes) uint8 cache.
++    Like reshape_and_cache_flash, the slot mapping's length sets the token count."""
++    num_tokens = slot_mapping.shape[0]
++    if num_tokens == 0:
++        return
++    head_dim = key.shape[-1]
++    row_bytes = qsa_fp4_row_bytes(head_dim)
++    assert kv_cache.dtype == torch.uint8 and kv_cache.shape[-1] == 2 * row_bytes, (
++        f"FP4 QSA cache must be uint8 with last dim {2 * row_bytes}, got "
++        f"{tuple(kv_cache.shape)} {kv_cache.dtype}"
++    )
++    assert key.stride(-1) == value.stride(-1) == 1 and kv_cache.stride(-1) == 1
++    _qsa_fp4_store_kernel[(num_tokens, key.shape[1])](
++        key,
++        value,
++        kv_cache,
++        slot_mapping,
++        key.stride(0),
++        key.stride(1),
++        value.stride(0),
++        value.stride(1),
++        kv_cache.stride(0),
++        kv_cache.stride(1),
++        kv_cache.stride(2),
++        PAGE_SIZE=kv_cache.shape[2],
++        HEAD_DIM=head_dim,
++        ROW_BYTES=row_bytes,
++        num_warps=2,
++    )
++# ------------------------------------------------------------------------------
++
++
+ @triton.jit(do_not_specialize=["num_rows", "num_requests"])
+ def _qsa_sparse_paged_gqa_splitk_kernel(
+     q_ptr,
+@@ -171,6 +327,29 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+             )
+             # UNSCALED: k_scale is folded into the score scaling below.
+             keys = _decode_e4m3_to_bf16(key_bytes)
++        elif KV_DTYPE == 3:
++            # FP4 row: [HEAD_DIM/2 packed nibbles][HEAD_DIM/16 E4M3 scales]. Each
++            # element reads its byte and its group scale; the duplicate loads
++            # hit L1, DRAM traffic stays at the packed row.
++            key_row = (
++                k_cache_ptr
++                + safe_page[None, :] * stride_k_block
++                + page_offset[None, :] * stride_k_token
++                + kv_head * stride_k_head
++            )
++            key_bytes = tl.load(
++                key_row + dim_offsets[:, None] // 2, mask=valid[None, :], other=0
++            ).to(tl.int32)
++            key_nibbles = (key_bytes >> ((dim_offsets[:, None] % 2) * 4)) & 0xF
++            key_scales = tl.load(
++                key_row + HEAD_DIM // 2 + dim_offsets[:, None] // 16,
++                mask=valid[None, :],
++                other=0,
++            )
++            keys = (
++                _decode_e2m1(key_nibbles)
++                * _decode_e4m3_to_bf16(key_scales).to(tl.float32)
++            ).to(tl.bfloat16)
+         else:
+             keys = tl.load(
+                 k_cache_ptr
+@@ -211,6 +390,26 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+             )
+             # UNSCALED: v_scale is folded into the epilogue below.
+             values = _decode_e4m3_to_bf16(value_bytes)
++        elif KV_DTYPE == 3:
++            value_row = (
++                v_cache_ptr
++                + safe_page[:, None] * stride_v_block
++                + page_offset[:, None] * stride_v_token
++                + kv_head * stride_v_head
++            )
++            value_bytes = tl.load(
++                value_row + dim_offsets[None, :] // 2, mask=valid[:, None], other=0
++            ).to(tl.int32)
++            value_nibbles = (value_bytes >> ((dim_offsets[None, :] % 2) * 4)) & 0xF
++            value_scales = tl.load(
++                value_row + HEAD_DIM // 2 + dim_offsets[None, :] // 16,
++                mask=valid[:, None],
++                other=0,
++            )
++            values = (
++                _decode_e2m1(value_nibbles)
++                * _decode_e4m3_to_bf16(value_scales).to(tl.float32)
++            ).to(tl.bfloat16)
+         elif KV_DTYPE == 2:
+             values = tl.load(
+                 v_cache_ptr
+@@ -578,9 +777,13 @@ def qsa_sparse_paged_attention(
+     _force_num_warps: int | None = None,
+     *,
+     output_gate: torch.Tensor,
++    kv_fp4: bool = False,
+ ) -> torch.Tensor:
+     """Run sparse GQA over paged BF16 or FP8 (E4M3 via static scalar scales) K/V caches.
+ 
++    local: ``kv_fp4`` reads the FP4 row layout (``qsa_fp4_row_bytes``) from uint8
++    caches; the static scalar scales do not apply (unit scales are passed).
++
+     ``_force_num_warps`` overrides the tuned launch profile for the warp-count
+     equivalence test only; production callers leave it None. Hardware policy
+     (E4M3 only on CUDA sm_86) is enforced once at Qwen4ExpQSAAttention /
+@@ -604,7 +807,8 @@ def qsa_sparse_paged_attention(
+         raise ValueError(
+             "QSA packed indices need selection columns plus the count column"
+         )
+-    if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
++    storage_dim = qsa_fp4_row_bytes(q.shape[2]) if kv_fp4 else q.shape[2]
++    if storage_dim != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
+         raise ValueError("QSA sparse attention requires valid grouped-query heads")
+     head_dim = q.shape[2]
+     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
+@@ -613,7 +817,14 @@ def qsa_sparse_paged_attention(
+     if k_cache.dtype != v_cache.dtype:
+         raise ValueError("QSA sparse attention requires matching K/V dtypes")
+     fp8_dtype = current_platform.fp8_dtype()
+-    if k_cache.dtype == torch.bfloat16:
++    if kv_fp4:
++        if k_cache.dtype not in (torch.uint8, fp8_dtype):
++            raise ValueError("QSA FP4 K/V storage must be a byte cache")
++        k_cache = k_cache.view(torch.uint8)
++        v_cache = v_cache.view(torch.uint8)
++        kv_dtype = 3
++        k_scale = v_scale = _unit_scale(q.device)
++    elif k_cache.dtype == torch.bfloat16:
+         kv_dtype = 0
+     elif k_cache.dtype in (torch.uint8, fp8_dtype):
+         kv_dtype = 1
+@@ -770,11 +981,15 @@ def warmup_qsa_sparse_paged_attention(
+     *,
+     num_query_heads: int,
+     selection_width: int,
++    kv_fp4: bool = False,
++    fp4_head_dim: int = 0,
+ ) -> tuple[tuple[int, int, int], ...]:
+     """Compile every production-reachable split-K/merge specialization."""
+ 
+-    head_dim = kv_cache.shape[-1] // 2
+-    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
++    storage_dim = kv_cache.shape[-1] // 2
++    head_dim = fp4_head_dim if kv_fp4 else storage_dim
++    assert not kv_fp4 or qsa_fp4_row_bytes(head_dim) == storage_dim
++    key_cache, value_cache = kv_cache.transpose(1, 2).split(storage_dim, dim=-1)
+     num_kv_heads = key_cache.shape[2]
+     group_size = num_query_heads // num_kv_heads
+     block_m = triton.next_power_of_2(group_size)
+@@ -796,7 +1011,10 @@ def warmup_qsa_sparse_paged_attention(
+     )
+     # Mirror qsa_sparse_paged_attention's dtype dispatch: E4M3 storage is launched
+     # as a uint8 view with scalar float32 scale pointers.
+-    if key_cache.dtype == torch.bfloat16:
++    if kv_fp4:
++        warm_kv_dtype = 3
++        warm_cache_dtype = torch.uint8
++    elif key_cache.dtype == torch.bfloat16:
+         warm_kv_dtype = 0
+         warm_cache_dtype = key_cache.dtype
+     elif key_cache.dtype in (torch.uint8, current_platform.fp8_dtype()):
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index 912e532..f112ff0 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -298,6 +298,12 @@ def _qsa_clip_count(
+ # writer), so this only measures the quality cost; it saves no memory. The
+ # extra FP8 rounding on top makes it slightly pessimistic vs real FP4 storage.
+ _QSA_KV_FP4_FAKE = os.environ.get("VLLM_EXP_QSA_KV_FP4_FAKE", "0") == "1"
++# VLLM_EXP_QSA_KV_FP4=1: REAL FP4 storage of the main K/V (same format, see
++# ops/qsa.py qsa_fp4_row_bytes): 144 B per K or V row instead of 256 B, written by
++# qsa_fp4_store_kv and read by the sparse kernel's KV_DTYPE=3 branch. The static
++# K/V scales (and the FP8 clipping counter) do not apply. Keep --kv-cache-dtype
++# fp8_e4m3 (byte cache); this flag only changes the QSA main-KV layout.
++_QSA_KV_FP4 = os.environ.get("VLLM_EXP_QSA_KV_FP4", "0") == "1"
+ _FP4_GROUP = 16
+ _FP4_E2M1_MAX = 6.0
+ _fp4_tables: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+@@ -554,7 +560,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+             raise RuntimeError("QSA owner did not provide its top-k buffer")
+         logical_indices = topk_buffer[:num_tokens]
+         token_to_req = token_to_req[:num_tokens]
+-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
++        from .ops.qsa import qsa_fp4_row_bytes
++
++        storage_size = qsa_fp4_row_bytes(self.head_size) if _QSA_KV_FP4 else self.head_size
++        key_cache, value_cache = kv_cache.transpose(1, 2).split(storage_size, dim=-1)
+         if query.dtype != torch.bfloat16:
+             raise NotImplementedError("Qwen4Exp QSA requires a BF16 query")
+         if key_cache.dtype != value_cache.dtype:
+@@ -603,6 +612,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
+             k_scale=layer._k_scale,
+             v_scale=layer._v_scale,
+             output_gate=output_gate[:num_tokens],
++            kv_fp4=_QSA_KV_FP4,
+         )
+         return output
+ 
+@@ -804,6 +814,20 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+         return self.attn_backend
+ 
+     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
++        if _QSA_KV_FP4:
++            from .ops.qsa import qsa_fp4_row_bytes
++
++            if not _is_qsa_fp8_cache_dtype(self.kv_cache_dtype):
++                raise ValueError("VLLM_EXP_QSA_KV_FP4 needs --kv-cache-dtype fp8_e4m3")
++            row = qsa_fp4_row_bytes(self.head_dim)
++            return FullAttentionSpec(
++                block_size=vllm_config.cache_config.block_size,
++                num_kv_heads=self.num_kv_heads,
++                head_size=row,
++                head_size_v=row,
++                dtype=torch.uint8,
++                kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
++            )
+         return FullAttentionSpec(
+             block_size=vllm_config.cache_config.block_size,
+             num_kv_heads=self.num_kv_heads,
+@@ -848,21 +872,28 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+         )
+         if selected.shape != (num_tokens, self.indexer.packed_output_width):
+             raise RuntimeError("QSA indexer returned an invalid selection shape")
+-        if _qsa_clip_interval > 0.0 and _is_qsa_fp8_cache_dtype(
+-            self.kv_cache_dtype
++        if (
++            _qsa_clip_interval > 0.0
++            and _is_qsa_fp8_cache_dtype(self.kv_cache_dtype)
++            and not _QSA_KV_FP4
+         ):
+             _qsa_clip_count(self, key, value, main_metadata.slot_mapping)
+         if _QSA_KV_FP4_FAKE:
+             key = _fp4_fake_quant(key)
+             value = _fp4_fake_quant(value)
+         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
+-        impl.do_kv_cache_update(
+-            self,
+-            key,
+-            value,
+-            self.kv_cache,
+-            main_metadata.slot_mapping,
+-        )
++        if _QSA_KV_FP4:
++            from .ops.qsa import qsa_fp4_store_kv
++
++            qsa_fp4_store_kv(key, value, self.kv_cache, main_metadata.slot_mapping)
++        else:
++            impl.do_kv_cache_update(
++                self,
++                key,
++                value,
++                self.kv_cache,
++                main_metadata.slot_mapping,
++            )
+         impl.forward_qsa(
+             self,
+             query,
+-- 
+2.53.0
+

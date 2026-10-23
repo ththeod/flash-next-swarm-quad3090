@@ -1,0 +1,194 @@
+From e6bce50ddf61eb6c5a4cdcd3eb606aee34844c8d Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 13:55:37 +0300
+Subject: [PATCH 128/138] Side-cache layout with the native CPU
+ OffloadingConnector (VLLM_E2_SIDE_CACHE_OFFLOAD=1)
+
+The v2.5 layout (PLE state folded into a GDN group's spare page, QSA rings
+slot-packed 512 per pool block) turned itself off for any KV connector. The
+native OffloadingConnector only offloads prefix-cacheable groups (never the
+ring or the drafter window) and copies whole pool blocks per key, so a GDN
+block now carrying the PLE page travels as one row. Allow it behind a new
+hashed switch (default off); the store fence maps ring slot ids to pool
+blocks; offloading refuses slot-packed groups. Per running request: -2 PLE
+pages, ring 1 page -> 1/512; per stored checkpoint one CPU row fewer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/test_envs.py                            |  4 ++
+ tests/v1/core/test_side_cache_layout.py       | 38 +++++++++++++++++++
+ .../kv_connector/v1/offloading/config.py      |  7 ++++
+ .../kv_connector/v1/offloading/scheduler.py   | 14 ++++++-
+ vllm/envs.py                                  |  6 +++
+ vllm/v1/core/kv_cache_utils.py                | 11 +++++-
+ 6 files changed, 77 insertions(+), 3 deletions(-)
+
+diff --git a/tests/test_envs.py b/tests/test_envs.py
+index 4871fda..f698720 100644
+--- a/tests/test_envs.py
++++ b/tests/test_envs.py
+@@ -625,6 +625,9 @@ _FORK_HASHED = [
+     # block table the PLE state is read through, so ON/OFF must not share an
+     # AOT cache. Strict "0"/"1", default ON; "0" selects the old layout.
+     ("VLLM_E2_SIDE_CACHE_LAYOUT", "0", False),
++    # local: side-cache layout under the CPU OffloadingConnector; turning it on
++    # changes the layout of an offloading engine, so it is hashed too.
++    ("VLLM_E2_SIDE_CACHE_OFFLOAD", "1", True),
+ ]
+ 
+ _FORK_IGNORED = [
+@@ -1072,6 +1075,7 @@ _MUST_BE_READ = {
+     "VLLM_E2_MAMBA_SLOT_OWNERSHIP": "vllm/v1/worker/mamba_utils.py",
+     "VLLM_E2_MAMBA_RETAIN_CHECKPOINT": "vllm/v1/core/single_type_kv_cache_manager.py",
+     "VLLM_E2_SIDE_CACHE_LAYOUT": "vllm/v1/core/kv_cache_utils.py",
++    "VLLM_E2_SIDE_CACHE_OFFLOAD": "vllm/v1/core/kv_cache_utils.py",
+     "VLLM_FAIL_ON_PROFILING_KV_LEAK": "vllm/v1/worker/gpu/cudagraph_utils.py",
+ }
+ _INERT_NO_READ_SITE = ["VLLM_PLE_FP8_GLOBAL_SCALE"]
+diff --git a/tests/v1/core/test_side_cache_layout.py b/tests/v1/core/test_side_cache_layout.py
+index 9ebba77..7b851ae 100644
+--- a/tests/v1/core/test_side_cache_layout.py
++++ b/tests/v1/core/test_side_cache_layout.py
+@@ -880,3 +880,41 @@ def test_zeroed_bytes_per_block_are_unchanged(monkeypatch, rank):
+         assert unskipped != old
+     else:
+         assert unskipped == old
++
++
++def _offload_switch(monkeypatch, value: str) -> None:
++    monkeypatch.setenv("VLLM_E2_SIDE_CACHE_OFFLOAD", value)
++    if hasattr(envs.__getattr__, "cache_clear"):
++        envs.__getattr__.cache_clear()
++
++
++def test_cpu_offloading_connector_gets_the_layout_with_the_switch(monkeypatch):
++    """Local 2026-10-22: the native CPU OffloadingConnector (RAM tier) keeps the
++    fold and the packed ring when VLLM_E2_SIDE_CACHE_OFFLOAD=1."""
++    _set_switch(monkeypatch, "1")
++    _offload_switch(monkeypatch, "1")
++    kvt = SimpleNamespace(
++        kv_connector="OffloadingConnector", kv_connector_module_path=None, kv_role="kv_both"
++    )
++    cfg, _, configs = _configs(kv_transfer_config=kvt)
++    assert _request_blocks(cfg, configs[0]) < 103
++    assert any(g.slots_per_block > 1 for g in configs[0].kv_cache_groups)
++
++
++@pytest.mark.parametrize(
++    "switch,connector,module_path",
++    [
++        ("0", "OffloadingConnector", None),        # switch off
++        ("1", "NixlConnector", None),              # other connector
++        ("1", "OffloadingConnector", "my.module"),  # out-of-tree connector class
++    ],
++)
++def test_other_connectors_keep_the_old_layout(monkeypatch, switch, connector, module_path):
++    _set_switch(monkeypatch, "1")
++    _offload_switch(monkeypatch, switch)
++    kvt = SimpleNamespace(
++        kv_connector=connector, kv_connector_module_path=module_path, kv_role="kv_both"
++    )
++    cfg, _, configs = _configs(kv_transfer_config=kvt)
++    assert _request_blocks(cfg, configs[0]) == 103
++    assert all(g.slots_per_block == 1 for g in configs[0].kv_cache_groups)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
+index 9f60c04..5eaae10 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
+@@ -78,6 +78,13 @@ def build_offloading_config(
+     )
+     if not selected_groups:
+         raise ValueError("KV offloading found no eligible cache groups.")
++    # local: a slot-packed group's block ids are pool_block * slots + slot and do
++    # not address whole pool blocks; it must never be offloaded.
++    for group_id, group in selected_groups:
++        if getattr(group, "slots_per_block", 1) != 1:
++            raise ValueError(
++                f"KV offloading cannot offload slot-packed cache group {group_id}"
++            )
+     groups = tuple(
+         OffloadingGroupConfig(
+             group_id=group_id,
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 1b7e6fd..0950f87 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -552,6 +552,11 @@ class OffloadingConnectorScheduler:
+         )
+         self.manager: OffloadingManager = spec.get_manager()
+         self._connector_stats = OffloadingConnectorStats()
++        # per KV group: block ids of a slot-packed group are pool_block * slots + slot
++        self._group_slots: tuple[int, ...] = tuple(
++            max(1, getattr(group, "slots_per_block", 1))
++            for group in kv_cache_config.kv_cache_groups
++        )
+ 
+         full_attention_groups: list[int] = []
+         sliding_window_groups: list[int] = []
+@@ -1378,10 +1383,15 @@ class OffloadingConnectorScheduler:
+                 # re-allocated to a group that is NOT offloaded (QSA ring, drafter
+                 # window) and overwritten before the copy ran. Fence on new blocks of
+                 # all groups, not only the offloaded ones.
+-                for new_blocks in new_block_id_groups:
++                for group_id, new_blocks in enumerate(new_block_id_groups):
++                    slots = (
++                        self._group_slots[group_id]
++                        if group_id < len(self._group_slots)
++                        else 1
++                    )
+                     for bid in new_blocks:
+                         if bid != 0:
+-                            self._current_batch_allocated_block_ids.add(bid)
++                            self._current_batch_allocated_block_ids.add(bid // slots)
+ 
+         for copy in scheduler_output.kv_cache_block_copies or ():
+             self._current_batch_allocated_block_ids.add(copy.dst_block_id)
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 143fa40..20f69fc 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -468,6 +468,7 @@ if TYPE_CHECKING:
+     # it changes the ring views' block stride and which block table the PLE
+     # state is read through, so ON and OFF must not share a compile cache.
+     VLLM_E2_SIDE_CACHE_LAYOUT: bool = True
++    VLLM_E2_SIDE_CACHE_OFFLOAD: bool = False
+     # Profiling-teardown leak policy (vllm/v1/worker/gpu/cudagraph_utils.py): a profiling
+     # KV cache still allocated after teardown fails the boot by default; "0", "false" or
+     # "no" downgrade it to a warning while diagnosing. AOT: no. CAPTURE: no -- it only
+@@ -2652,6 +2653,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_E2_SIDE_CACHE_LAYOUT": lambda: _e2_strict_switch(
+         "VLLM_E2_SIDE_CACHE_LAYOUT", default=True
+     ),
++    # Local 2026-10-22: allow the side-cache layout with the native CPU
++    # OffloadingConnector (RAM tier). Strict "0"/"1", default OFF.
++    "VLLM_E2_SIDE_CACHE_OFFLOAD": lambda: _e2_strict_switch(
++        "VLLM_E2_SIDE_CACHE_OFFLOAD", default=False
++    ),
+     # Profiling-teardown leak policy: fail the boot unless "0"/"false"/"no".
+     "VLLM_FAIL_ON_PROFILING_KV_LEAK": lambda: os.getenv(
+         "VLLM_FAIL_ON_PROFILING_KV_LEAK", "1"
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 2d81658..c47aef8 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -2726,7 +2726,16 @@ def _side_cache_layout_enabled(vllm_config: VllmConfig) -> bool:
+     """
+     if not envs.VLLM_E2_SIDE_CACHE_LAYOUT:
+         return False
+-    if getattr(vllm_config, "kv_transfer_config", None) is not None:
++    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
++    if kv_transfer_config is not None and not (
++        # local: the native CPU offload connector only touches prefix-cacheable
++        # groups and copies whole pool blocks, so it works with the fold and the
++        # packed ring (its store fence maps ring slot ids to pool blocks).
++        envs.VLLM_E2_SIDE_CACHE_OFFLOAD
++        and getattr(kv_transfer_config, "kv_connector", None) == "OffloadingConnector"
++        and getattr(kv_transfer_config, "kv_connector_module_path", None) is None
++        and getattr(kv_transfer_config, "kv_role", None) == "kv_both"
++    ):
+         return False
+     attention_config = getattr(vllm_config, "attention_config", None)
+     if getattr(attention_config, "hisparse_config", None) is not None:
+-- 
+2.53.0
+

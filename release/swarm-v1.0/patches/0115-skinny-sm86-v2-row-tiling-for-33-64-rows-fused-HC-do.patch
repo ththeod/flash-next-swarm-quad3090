@@ -1,0 +1,547 @@
+From 2a33f8b37f583c21ebff75b61ef0e29390ec74be Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 11:29:24 +0300
+Subject: [PATCH 115/138] skinny sm86 v2: row tiling for 33-64 rows + fused HC
+ down/silu (VLLM_EXP_SKINNY_SM86_HC=1)
+
+- Grid (M tile, N tile, K split), M tiles fastest so programs sharing a W
+  tile run together; split-K partials/counters per (M, N) tile. Plans can now
+  cover 48/64 rows with 2-4 smaller tiles (W23: several 48/64-row shapes now
+  beat cuBLAS; with realistic clocks cuBLAS stays competitive on others).
+- VLLM_EXP_SKINNY_SM86_HC=1: HyperConnection down projection applies hc_silu
+  in its epilogue (rounds where the unfused op rounds: bit-exact, W23 hctest);
+  GatedResidual._project routes through qwen4_exp_skinny_sm86_hc_down /
+  _hc_up_mix. The fused up projection + gate mix kernel is kept but lost to
+  skinny GEMM + hc_gate_mix at every M (walks the 4 streams serially), so no
+  "mix:" plans: _hc_up_mix falls back to the skinny GEMM, then hc_gate_mix.
+- VLLM_EXP_SKINNY_SM86_HC registered as a compile factor.
+
+W23 (plans-sm86-w23.json, tuned with idle gaps between replays: back-to-back
+replays had throttled the 200 W-capped 3090s to ~330 MHz SM in W18):
+greedy single code/prose/count 281.9/121.9/373.2 (p5 264.0/129.8/369.9,
+p3b 241.8/112.2/335.3); unfused v2 275.6/115.3/371.9; stress 1000x PASS,
+hctest PASS, probes 8/8 x2, NaN poke clean, GSM8K 97.0, 0 runtime errors.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/envs.py                                  |   2 +
+ .../qwen4_exp/nvidia/hyperconnection.py       |  52 ++--
+ .../qwen4_exp/nvidia/ops/skinny_sm86.py       | 260 ++++++++++++++++--
+ 3 files changed, 268 insertions(+), 46 deletions(-)
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 6b5960d..143fa40 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -2399,6 +2399,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_EXP_SKINNY_SM86_PLANS": lambda: os.getenv(
+         "VLLM_EXP_SKINNY_SM86_PLANS", "/opt/flash-next/skinny/plans-sm86.json"
+     ),
++    # Fused HyperConnection chain on top of the skinny GEMM (changes the graph).
++    "VLLM_EXP_SKINNY_SM86_HC": lambda: os.getenv("VLLM_EXP_SKINNY_SM86_HC", "0"),
+     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
+         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
+     ),
+diff --git a/vllm/models/qwen4_exp/nvidia/hyperconnection.py b/vllm/models/qwen4_exp/nvidia/hyperconnection.py
+index acdba8c..a6a205a 100644
+--- a/vllm/models/qwen4_exp/nvidia/hyperconnection.py
++++ b/vllm/models/qwen4_exp/nvidia/hyperconnection.py
+@@ -35,6 +35,7 @@ from ..common.hyperconnection import (
+     GroupedGemmaRMSNorm,
+     HyperConnectionConfig,
+ )
++from .ops import skinny_sm86
+ from .ops.hc import (
+     grouped_gemma_rmsnorm,
+     hc_combine,
+@@ -135,19 +136,7 @@ class GatedResidual(nn.Module):
+             self.hc_count,
+         )
+ 
+-        if self.use_combine:
+-            # produce injection logits for combine
+-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+-            down_and_injection = self.input_mix_weight_down_block_inject(xn)
+-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+-        else:
+-            lora = self.input_mix_weight_down(xn)
+-            injection = None
+-
+-        lora = hc_silu(lora, self.hc_count)
+-        gate = self.input_mix_weight_up(lora)  # [M, D]
+-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+-
++        block_input, injection = self._project(xn)
+         return hidden_states, block_input, injection
+ 
+     def combine_and_mix(
+@@ -172,20 +161,47 @@ class GatedResidual(nn.Module):
+             self.hc_count,
+         )
+ 
++        block_input, injection = self._project(xn)
++        return hidden_states, block_input, injection
++
++    def _project(
++        self, xn: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor | None]:
++        """down(+inject) -> hc_silu -> up -> hc_gate_mix; with the sm_86 fused
++        HC chain (VLLM_EXP_SKINNY_SM86_HC=1) the silu runs in the down GEMM's
++        epilogue and the gate mix in the up GEMM's."""
++        down = (
++            self.input_mix_weight_down_block_inject
++            if self.use_combine
++            else self.input_mix_weight_down
++        )
++        split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
++        slot = skinny_sm86.hc_fused_slot(down)
++        if slot is not None:
++            down_out = torch.ops.vllm.qwen4_exp_skinny_sm86_hc_down(
++                xn, down.weight, slot, self.lora_rank, self.hc_count
++            )
++            if self.use_combine:
++                lora, injection, _ = down_out.split(split_sizes, dim=-1)
++            else:
++                lora, injection = down_out, None
++            block_input = torch.ops.vllm.qwen4_exp_skinny_sm86_hc_up_mix(
++                lora, self.input_mix_weight_up.weight, xn, self.hc_count
++            )
++            return block_input, injection
++
+         if self.use_combine:
+             # produce injection logits for combine
+-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+-            down_and_injection = self.input_mix_weight_down_block_inject(xn)
++            down_and_injection = down(xn)
+             lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+         else:
+-            lora = self.input_mix_weight_down(xn)
++            lora = down(xn)
+             injection = None
+ 
+         lora = hc_silu(lora, self.hc_count)
+         gate = self.input_mix_weight_up(lora)  # [M, D]
+         block_input = hc_gate_mix(xn, gate, self.hc_count)
+-
+-        return hidden_states, block_input, injection
++        return block_input, injection
+ 
+     def combine(
+         self,
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/skinny_sm86.py b/vllm/models/qwen4_exp/nvidia/ops/skinny_sm86.py
+index 44333f6..b3bf6a4 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/skinny_sm86.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/skinny_sm86.py
+@@ -7,16 +7,25 @@ rows, so every GEMM reads its whole weight once and is bound by memory
+ bandwidth. On the 3090s cuBLAS picks 16x16 wmma tiles and split-K + reduce
+ kernels that take ~2.7x the bandwidth floor (2026-10-21 decode profile).
+ 
+-Y[M, N] = X[M, K] @ W[N, K]^T: one program per (N tile, K split), tensor-core
+-dot with M padded to BLOCK_M. With SPLIT_K > 1 every split stores an fp32
+-partial and the last split to arrive (per-tile counter) sums them in fixed
+-order and resets the counter: deterministic, one launch. Every enabled layer
+-owns its counters and partials (a "slot"), so layers on different streams
+-never share them.
++Y[M, N] = X[M, K] @ W[N, K]^T: one program per (M tile, N tile, K split),
++tensor-core dot with M padded to BLOCK_M. M tiles vary fastest in launch order,
++so the programs that share a W tile run together and all but the first read it
++from L2. With SPLIT_K > 1 every split stores an fp32 partial and the last split
++to arrive (per-tile counter) sums them in fixed order and resets the counter:
++deterministic, one launch. Every enabled layer owns its counters and partials
++(a "slot"), so layers on different streams never share them.
++
++VLLM_EXP_SKINNY_SM86_HC=1 also fuses the HyperConnection chain around the two
++projections: the down projection applies hc_silu to its LoRA columns in the
++epilogue, and the up projection computes the sigmoid gate mix over the HC
++streams in its epilogue (block input instead of the [M, HC*H] gate). Both
++round exactly where the unfused ops round, so they match the unfused skinny
++path bit for bit.
+ 
+ Plans are measured per local (N, K) shape and M bucket by
+ /opt/flash-next/skinny/bench.py and read from VLLM_EXP_SKINNY_SM86_PLANS
+-(JSON); shapes and M without a plan, and M > 64, keep F.linear.
++(JSON; "mix:NxK" keys are fused up-projection plans); shapes and M without a
++plan, and M > 64, keep F.linear (and the unfused HC ops).
+ """
+ 
+ import json
+@@ -35,13 +44,17 @@ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
++from .hc import _hc_gate_mix, _hc_silu
++
+ logger = init_logger(__name__)
+ 
+ ENABLED = os.environ.get("VLLM_EXP_SKINNY_SM86", "0") == "1"
++HC_FUSE = os.environ.get("VLLM_EXP_SKINNY_SM86_HC", "0") == "1"
+ PLANS_PATH = os.environ.get(
+     "VLLM_EXP_SKINNY_SM86_PLANS", "/opt/flash-next/skinny/plans-sm86.json"
+ )
+ M_BUCKETS = (8, 16, 32, 48, 64)
++M_MAX = M_BUCKETS[-1]
+ 
+ 
+ @triton.jit
+@@ -58,6 +71,16 @@ def _fence_gpu(x):
+     )
+ 
+ 
++@triton.jit
++def _epilogue(acc, offs_n, ACT_N, HC: tl.constexpr, EPI: tl.constexpr):
++    if EPI == 1:
++        # hc_silu on the LoRA columns: the unfused path rounds the GEMM output
++        # to bf16, then computes silu(x / HC) in fp32.
++        v = acc.to(tl.bfloat16).to(tl.float32) / HC
++        acc = tl.where(offs_n[None, :] < ACT_N, v * tl.sigmoid(v), acc)
++    return acc
++
++
+ @triton.jit
+ def _skinny_gemm_kernel(
+     x_ptr,
+@@ -71,14 +94,18 @@ def _skinny_gemm_kernel(
+     stride_xm,
+     stride_wn,
+     stride_ym,
++    ACT_N,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     BLOCK_K: tl.constexpr,
+     SPLIT_K: tl.constexpr,
++    HC: tl.constexpr,
++    EPI: tl.constexpr,
+ ):
+-    pid_n = tl.program_id(0)
+-    pid_k = tl.program_id(1)
+-    offs_m = tl.arange(0, BLOCK_M)
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++    pid_k = tl.program_id(2)
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+     offs_k = tl.arange(0, BLOCK_K)
+     k_len = K // SPLIT_K
+@@ -99,15 +126,19 @@ def _skinny_gemm_kernel(
+     y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :]
+     y_mask = m_mask[:, None] & n_mask[None, :]
+     if SPLIT_K == 1:
++        acc = _epilogue(acc, offs_n, ACT_N, HC, EPI)
+         tl.store(y_ptrs, acc.to(y_ptr.dtype.element_ty), mask=y_mask)
+     else:
+-        offs_t = offs_m[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
+-        tile = ws_ptr + pid_n * (SPLIT_K * BLOCK_M * BLOCK_N)
++        offs_t = (offs_m[:, None] - pid_m * BLOCK_M) * BLOCK_N + tl.arange(
++            0, BLOCK_N
++        )[None, :]
++        tile_id = pid_n * tl.num_programs(0) + pid_m
++        tile = ws_ptr + tile_id * (SPLIT_K * BLOCK_M * BLOCK_N)
+         tl.store(tile + pid_k * (BLOCK_M * BLOCK_N) + offs_t, acc)
+         f = _fence_gpu(tl.full([1], 0, tl.int32))
+         tl.debug_barrier()
+         arrived = tl.atomic_add(
+-            cnt_ptr + pid_n + tl.sum(f, 0), 1, sem="acq_rel", scope="gpu"
++            cnt_ptr + tile_id + tl.sum(f, 0), 1, sem="acq_rel", scope="gpu"
+         )
+         if arrived == SPLIT_K - 1:
+             f2 = _fence_gpu(tl.full([1], 0, tl.int32))
+@@ -117,8 +148,65 @@ def _skinny_gemm_kernel(
+                 total += tl.load(
+                     tile + s * (BLOCK_M * BLOCK_N) + offs_t, cache_modifier=".cg"
+                 )
++            total = _epilogue(total, offs_n, ACT_N, HC, EPI)
+             tl.store(y_ptrs, total.to(y_ptr.dtype.element_ty), mask=y_mask)
+-            tl.atomic_xchg(cnt_ptr + pid_n, 0, sem="relaxed", scope="gpu")
++            tl.atomic_xchg(cnt_ptr + tile_id, 0, sem="relaxed", scope="gpu")
++
++
++@triton.jit
++def _skinny_hc_up_mix_kernel(
++    x_ptr,
++    w_ptr,
++    xn_ptr,
++    y_ptr,
++    M,
++    HS,
++    K,
++    stride_xm,
++    stride_wn,
++    stride_xnm,
++    stride_ym,
++    HC: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    # y[m, h] = mean_c sigmoid((x @ W[c * HS + h]^T)[m]) * xn[m, c * HS + h]:
++    # the up projection and hc_gate_mix in one pass (the gate never leaves the
++    # registers). The gate rounds to bf16 before the sigmoid, as unfused.
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_h = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    offs_k = tl.arange(0, BLOCK_K)
++    m_mask = offs_m < M
++    h_mask = offs_h < HS
++    out = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    for c in tl.static_range(HC):
++        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :]
++        w_ptrs = w_ptr + (c * HS + offs_h)[:, None] * stride_wn + offs_k[None, :]
++        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++        for _ in range(0, K, BLOCK_K):
++            x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
++            w = tl.load(
++                w_ptrs, mask=h_mask[:, None], other=0.0, eviction_policy="evict_first"
++            )
++            acc = tl.dot(x, tl.trans(w), acc)
++            x_ptrs += BLOCK_K
++            w_ptrs += BLOCK_K
++        g = acc.to(tl.bfloat16).to(tl.float32)
++        xv = tl.load(
++            xn_ptr + offs_m[:, None] * stride_xnm + (c * HS + offs_h)[None, :],
++            mask=m_mask[:, None] & h_mask[None, :],
++            other=0.0,
++        )
++        out += tl.sigmoid(g) * xv.to(tl.float32)
++    out = out / HC
++    tl.store(
++        y_ptr + offs_m[:, None] * stride_ym + offs_h[None, :],
++        out.to(y_ptr.dtype.element_ty),
++        mask=m_mask[:, None] & h_mask[None, :],
++    )
+ 
+ 
+ # (block_m, block_n, block_k, split_k, num_warps, num_stages)
+@@ -132,12 +220,15 @@ def launch(
+     ws: torch.Tensor,
+     cnt: torch.Tensor,
+     out: torch.Tensor | None = None,
++    act_n: int = 0,
++    hc: int = 1,
+ ) -> torch.Tensor:
++    """Y = X @ W^T; act_n > 0 applies hc_silu (HC = hc) to columns < act_n."""
+     bm, bn, bk, sk, warps, stages = cfg
+     m, k = x.shape
+     n = w.shape[0]
+     y = out if out is not None else x.new_empty((m, n))
+-    _skinny_gemm_kernel[(triton.cdiv(n, bn), sk)](
++    _skinny_gemm_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn), sk)](
+         x,
+         w,
+         y,
+@@ -149,22 +240,60 @@ def launch(
+         x.stride(0),
+         w.stride(0),
+         y.stride(0),
++        act_n,
+         BLOCK_M=bm,
+         BLOCK_N=bn,
+         BLOCK_K=bk,
+         SPLIT_K=sk,
++        HC=hc,
++        EPI=1 if act_n > 0 else 0,
++        num_warps=warps,
++        num_stages=stages,
++    )
++    return y
++
++
++def launch_up_mix(
++    x: torch.Tensor,
++    w: torch.Tensor,
++    xn: torch.Tensor,
++    cfg: Config,
++    hc: int,
++    out: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """hc_gate_mix(xn, x @ W^T, hc) without materializing the gate."""
++    bm, bn, bk, _, warps, stages = cfg
++    m, k = x.shape
++    hs = w.shape[0] // hc
++    y = out if out is not None else xn.new_empty((m, hs))
++    _skinny_hc_up_mix_kernel[(triton.cdiv(m, bm), triton.cdiv(hs, bn))](
++        x,
++        w,
++        xn,
++        y,
++        m,
++        hs,
++        k,
++        x.stride(0),
++        w.stride(0),
++        xn.stride(0),
++        y.stride(0),
++        HC=hc,
++        BLOCK_M=bm,
++        BLOCK_N=bn,
++        BLOCK_K=bk,
+         num_warps=warps,
+         num_stages=stages,
+     )
+     return y
+ 
+ 
+-def scratch_size(cfg: Config, n: int) -> tuple[int, int]:
+-    """fp32 partial elements and counters a config needs for N columns."""
++def scratch_size(cfg: Config, n: int, m: int = M_MAX) -> tuple[int, int]:
++    """fp32 partial elements and counters a config needs for up to m x n."""
+     bm, bn, _, sk, _, _ = cfg
+     if sk == 1:
+         return 0, 0
+-    tiles = triton.cdiv(n, bn)
++    tiles = triton.cdiv(n, bn) * triton.cdiv(m, bm)
+     return tiles * sk * bm * bn, tiles
+ 
+ 
+@@ -176,6 +305,7 @@ def m_bucket(m: int) -> int | None:
+ 
+ 
+ _plans: dict[tuple[int, int], dict[int, Config]] | None = None
++_mix_plans: dict[tuple[int, int], dict[int, Config]] = {}
+ # slot -> (weight shape, plan by M bucket, fp32 partials, int32 counters)
+ _slots: list[tuple[tuple[int, int], dict[int, Config], torch.Tensor, torch.Tensor]] = []
+ 
+@@ -191,8 +321,11 @@ def load_plans() -> dict[tuple[int, int], dict[int, Config]]:
+             logger.warning("skinny sm86: no plan file %s", PLANS_PATH)
+             raw = {}
+         for key, by_m in raw.items():
++            target = _plans
++            if key.startswith("mix:"):
++                key, target = key[4:], _mix_plans
+             n, k = (int(v) for v in key.split("x"))
+-            _plans[(n, k)] = {int(m): tuple(c) for m, c in by_m.items()}
++            target[(n, k)] = {int(m): tuple(c) for m, c in by_m.items()}
+     return _plans
+ 
+ 
+@@ -200,17 +333,20 @@ def is_supported() -> bool:
+     return ENABLED and current_platform.is_device_capability((8, 6))
+ 
+ 
++def _usable(x: torch.Tensor, weight: torch.Tensor, shape: tuple[int, int]) -> bool:
++    return (
++        x.dim() == 2
++        and x.dtype == torch.bfloat16
++        and x.stride(1) == 1
++        and weight.stride(1) == 1
++        and tuple(weight.shape) == shape
++    )
++
++
+ def _gemm(x: torch.Tensor, weight: torch.Tensor, slot: int) -> torch.Tensor:
+     shape, plan, ws, cnt = _slots[slot]
+     cfg = plan.get(m_bucket(x.shape[0]) or 0)
+-    if (
+-        cfg is None
+-        or x.dim() != 2
+-        or x.dtype != torch.bfloat16
+-        or x.stride(1) != 1
+-        or weight.stride(1) != 1
+-        or tuple(weight.shape) != shape
+-    ):
++    if cfg is None or not _usable(x, weight, shape):
+         return torch.nn.functional.linear(x, weight)
+     return launch(x, weight, cfg, ws, cnt)
+ 
+@@ -219,11 +355,68 @@ def _gemm_fake(x: torch.Tensor, weight: torch.Tensor, slot: int) -> torch.Tensor
+     return x.new_empty((*x.shape[:-1], weight.shape[0]))
+ 
+ 
++def _hc_down(
++    xn: torch.Tensor, weight: torch.Tensor, slot: int, act_n: int, hc: int
++) -> torch.Tensor:
++    shape, plan, ws, cnt = _slots[slot]
++    cfg = plan.get(m_bucket(xn.shape[0]) or 0)
++    if cfg is None or not _usable(xn, weight, shape):
++        y = torch.nn.functional.linear(xn, weight)
++        y[:, :act_n] = _hc_silu(y[:, :act_n], hc)
++        return y
++    return launch(xn, weight, cfg, ws, cnt, act_n=act_n, hc=hc)
++
++
++def _hc_down_fake(
++    xn: torch.Tensor, weight: torch.Tensor, slot: int, act_n: int, hc: int
++) -> torch.Tensor:
++    return xn.new_empty((xn.shape[0], weight.shape[0]))
++
++
++def _hc_up_mix(
++    lora: torch.Tensor, weight: torch.Tensor, xn: torch.Tensor, hc: int
++) -> torch.Tensor:
++    shape = (int(weight.shape[0]), int(weight.shape[1]))
++    bucket = m_bucket(lora.shape[0]) or 0
++    cfg = _mix_plans.get(shape, {}).get(bucket)
++    usable = (
++        _usable(lora, weight, shape)
++        and xn.stride(1) == 1
++        and xn.dtype == torch.bfloat16
++    )
++    if cfg is not None and usable:
++        return launch_up_mix(lora, weight, xn, cfg, hc)
++    # No fused plan for this M: the skinny GEMM (when it has a split-free plan,
++    # which needs no scratch slot) or F.linear, then the hc_gate_mix kernel.
++    gcfg = load_plans().get(shape, {}).get(bucket)
++    if gcfg is not None and gcfg[3] == 1 and usable:
++        gate = launch(lora, weight, gcfg, weight, weight)
++    else:
++        gate = torch.nn.functional.linear(lora, weight)
++    return _hc_gate_mix(xn, gate, hc)
++
++
++def _hc_up_mix_fake(
++    lora: torch.Tensor, weight: torch.Tensor, xn: torch.Tensor, hc: int
++) -> torch.Tensor:
++    return xn.new_empty((xn.shape[0], xn.shape[1] // hc))
++
++
+ direct_register_custom_op(
+     op_name="qwen4_exp_skinny_sm86_gemm",
+     op_func=_gemm,
+     fake_impl=_gemm_fake,
+ )
++direct_register_custom_op(
++    op_name="qwen4_exp_skinny_sm86_hc_down",
++    op_func=_hc_down,
++    fake_impl=_hc_down_fake,
++)
++direct_register_custom_op(
++    op_name="qwen4_exp_skinny_sm86_hc_up_mix",
++    op_func=_hc_up_mix,
++    fake_impl=_hc_up_mix_fake,
++)
+ 
+ 
+ class _SkinnyApply:
+@@ -255,6 +448,15 @@ class SkinnyEmbeddingMethod(_SkinnyApply, UnquantizedEmbeddingMethod):
+         self.slot = slot
+ 
+ 
++def hc_fused_slot(down: nn.Module) -> int | None:
++    """Slot of a HyperConnection down projection when the fused HC chain is on
++    (it needs the down projection's scratch slot); None keeps the unfused ops."""
++    if not HC_FUSE:
++        return None
++    method = getattr(down, "quant_method", None)
++    return method.slot if isinstance(method, SkinnyLinearMethod) else None
++
++
+ def enable(module: nn.Module, dtype: torch.dtype, tag: str) -> None:
+     """Route this module tree's bf16 linears and LM head through the skinny
+     GEMM where a plan exists; logs every eligible shape either way."""
+@@ -295,10 +497,12 @@ def enable(module: nn.Module, dtype: torch.dtype, tag: str) -> None:
+             SkinnyLinearMethod(slot) if is_linear else SkinnyEmbeddingMethod(slot)
+         )
+     logger.info(
+-        "skinny sm86 (%s): %s",
++        "skinny sm86 (%s): %s; fused HC %s (mix plans: %s)",
+         tag,
+         ", ".join(
+             f"{n}x{k}: {on}/{tot}" for (n, k), (tot, on) in sorted(seen.items())
+         )
+         or "no eligible linears",
++        "on" if HC_FUSE else "off",
++        ", ".join(f"{n}x{k}" for n, k in sorted(_mix_plans)) or "none",
+     )
+-- 
+2.53.0
+

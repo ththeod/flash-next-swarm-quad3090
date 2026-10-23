@@ -1,0 +1,43 @@
+From b9fec89efbecfed917d9ab1ab320acf97b2d54c1 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 18:49:46 +0300
+Subject: [PATCH 102/138] exp: V2 runner: Qwen4Exp's MTP pre-HC buffer is None
+ for non-MTP drafters; fall back to the sampled hidden states
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/worker/gpu/model_runner.py | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index bb83954..bd642f1 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -957,7 +957,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             spec_hidden_states = hidden_states
+             if hasattr(self.model, "get_mtp_target_hidden_states"):
+                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
++                # local (DFlash 2 experiment): Qwen4Exp only keeps this buffer for
++                # method="mtp"; other drafters use the sampled hidden states.
++                if pre_hc_hidden_states is not None:
++                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+             if isinstance(self.sampler, GPUWatermarkSampler):
+                 self.speculator.prepare_watermarking(
+                     self.sampler._get_contexts(input_batch.idx_mapping),
+@@ -2438,7 +2441,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             spec_hidden_states = draft_hidden_states
+             if hasattr(self.model, "get_mtp_target_hidden_states"):
+                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+-                spec_hidden_states = pre_hc_hidden_states[: draft_hidden_states.size(0)]
++                # local (DFlash 2 experiment): None unless method="mtp" (see above).
++                if pre_hc_hidden_states is not None:
++                    spec_hidden_states = pre_hc_hidden_states[
++                        : draft_hidden_states.size(0)
++                    ]
+             if isinstance(self.sampler, GPUWatermarkSampler):
+                 self.speculator.prepare_watermarking(
+                     self.sampler._get_contexts(input_batch.idx_mapping),
+-- 
+2.53.0
+

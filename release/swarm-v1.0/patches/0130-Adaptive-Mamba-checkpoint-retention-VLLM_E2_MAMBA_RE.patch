@@ -1,0 +1,381 @@
+From 05045a8dc57a6bc76aaae666ed1e398aaa00cdc0 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 16:12:12 +0300
+Subject: [PATCH 130/138] Adaptive Mamba checkpoint retention
+ (VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S)
+
+Held prefix checkpoints cost each running request about one block per GDN
+group and only pay off while the GPU prefix cache is not churning. With
+VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S=N (> 0) the scheduler switches retention off
+at the first capacity failure (a waiting request that cannot get blocks, or a
+running one before it would be preempted), freeing every held checkpoint into
+the cached free queue, and switches it back on after N seconds without one.
+Unset/0 keeps static retention.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/test_envs.py                            |  3 ++
+ .../core/test_mamba_checkpoint_retention.py   | 51 ++++++++++++++++++
+ tests/v1/core/test_scheduler.py               | 40 ++++++++++++++
+ vllm/envs.py                                  | 25 +++++++++
+ vllm/v1/core/kv_cache_manager.py              | 13 +++++
+ vllm/v1/core/sched/scheduler.py               | 53 +++++++++++++++++++
+ vllm/v1/core/single_type_kv_cache_manager.py  | 20 ++++++-
+ 7 files changed, 204 insertions(+), 1 deletion(-)
+
+diff --git a/tests/test_envs.py b/tests/test_envs.py
+index f698720..90518ff 100644
+--- a/tests/test_envs.py
++++ b/tests/test_envs.py
+@@ -658,6 +658,8 @@ _FORK_IGNORED = [
+     # Mamba prefix-checkpoint retention (v2.5): scheduler-side, default ON; "0"
+     # turns it off. Read in single_type_kv_cache_manager.py (MambaManager).
+     ("VLLM_E2_MAMBA_RETAIN_CHECKPOINT", "0", False),
++    # Adaptive retention hold-off (local 2026-10-22): scheduler-side, 0 = off.
++    ("VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S", "45", 45.0),
+     # Profiling-teardown leak policy: fails the boot unless "0"/"false"/"no".
+     ("VLLM_FAIL_ON_PROFILING_KV_LEAK", "no", False),
+     # Medium-path counter reader: a host-side log cadence, and the older slot-count
+@@ -1074,6 +1076,7 @@ _MUST_BE_READ = {
+     "VLLM_E2_PLE_FLAG_CHECK": "vllm/v1/ple_offload/connector.py",
+     "VLLM_E2_MAMBA_SLOT_OWNERSHIP": "vllm/v1/worker/mamba_utils.py",
+     "VLLM_E2_MAMBA_RETAIN_CHECKPOINT": "vllm/v1/core/single_type_kv_cache_manager.py",
++    "VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S": "vllm/v1/core/sched/scheduler.py",
+     "VLLM_E2_SIDE_CACHE_LAYOUT": "vllm/v1/core/kv_cache_utils.py",
+     "VLLM_E2_SIDE_CACHE_OFFLOAD": "vllm/v1/core/kv_cache_utils.py",
+     "VLLM_FAIL_ON_PROFILING_KV_LEAK": "vllm/v1/worker/gpu/cudagraph_utils.py",
+diff --git a/tests/v1/core/test_mamba_checkpoint_retention.py b/tests/v1/core/test_mamba_checkpoint_retention.py
+index 502e68b..3d837bf 100644
+--- a/tests/v1/core/test_mamba_checkpoint_retention.py
++++ b/tests/v1/core/test_mamba_checkpoint_retention.py
+@@ -640,3 +640,54 @@ def test_hit_followup_is_admitted_when_it_exactly_fits(retain):
+     )
+     assert blocks is not None
+     pool.free_blocks(held)
++
++
++# --------------------------------------------------------------------------
++# (local 2026-10-22) Adaptive retention: runtime switch.
++# --------------------------------------------------------------------------
++def _held_ids(manager: KVCacheManager) -> set[int]:
++    return {
++        b.block_id
++        for gid in MAMBA_GROUPS
++        for _, b in _mamba(manager, gid)._retained_checkpoints.values()
++    }
++
++
++def test_runtime_switch_releases_held_checkpoints_and_resumes(retain):
++    """Switching retention off mid-request frees the held checkpoints into the
++    cached free queue (still hashed, hit-able until evicted) and stops new
++    holds; switching it back on holds the next retired state again. Without
++    configured retention the switch is a no-op."""
++    manager = _manager(num_blocks=64)
++    pool = manager.block_pool
++    a = _request("A", _tokens(1, 150))
++    _prefill(manager, a)
++    _decode(manager, a, steps=6)
++    held = _held_ids(manager)
++    assert len(held) == (len(MAMBA_GROUPS) if retain else 0)
++
++    free_before = pool.get_num_free_blocks()
++    assert manager.set_checkpoint_retention(False) == len(held)
++    assert pool.get_num_free_blocks() == free_before + len(held)
++    assert not _held_ids(manager)
++    for bid in held:
++        assert _hashed_cached(manager, pool.blocks[bid])
++
++    # Decode across block boundaries: retired states are released, not held.
++    _decode(manager, a, steps=3 * BLOCK, accepted=lambda step: 0)
++    assert not _held_ids(manager)
++    assert manager.set_checkpoint_retention(False) == 0  # idempotent
++
++    # Back on: holds are taken where a request's replay-boundary state retires
++    # (its prefill / resume), so the next request (or A's next turn) holds.
++    assert manager.set_checkpoint_retention(True) == 0
++    b = _request("B", _tokens(2, 150))
++    _prefill(manager, b)
++    _decode(manager, b, steps=6)
++    for gid in MAMBA_GROUPS:
++        assert ("B" in _mamba(manager, gid)._retained_checkpoints) is retain
++        assert "A" not in _mamba(manager, gid)._retained_checkpoints
++
++    manager.free(a)
++    manager.free(b)
++    assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 1  # nothing leaked
+diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
+index c316d88..71e8554 100644
+--- a/tests/v1/core/test_scheduler.py
++++ b/tests/v1/core/test_scheduler.py
+@@ -1372,6 +1372,46 @@ def test_deferred_lookup_keeps_arrival_order():
+     assert newer.request_id not in scheduled
+ 
+ 
++def test_adaptive_retention_follows_capacity_failures(monkeypatch):
++    """(local 2026-10-22) VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S: the first capacity
++    failure switches checkpoint retention off (once), and it comes back on
++    only after that many seconds without another failure."""
++    monkeypatch.setenv("VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S", "45")
++    if hasattr(envs.__getattr__, "cache_clear"):
++        envs.__getattr__.cache_clear()
++    scheduler = create_scheduler(num_blocks=6, block_size=16)
++    calls: list[bool] = []
++
++    def switch(on: bool) -> int:
++        calls.append(on)
++        return 0 if on else 2
++
++    monkeypatch.setattr(scheduler.kv_cache_manager, "set_checkpoint_retention", switch)
++    now = [1000.0]
++    import vllm.v1.core.sched.scheduler as sched_mod
++
++    monkeypatch.setattr(sched_mod.time, "monotonic", lambda: now[0])
++
++    big = create_requests(num_requests=1, num_tokens=160, block_size=16)[0]
++    scheduler.add_request(big)  # 10 blocks; the pool has 5
++    assert not scheduler.schedule().num_scheduled_tokens
++    assert calls == [False]
++    now[0] += 30
++    scheduler.schedule()  # still failing: stays off, failure time refreshed
++    assert calls == [False]
++
++    scheduler.finish_requests(big.request_id, RequestStatus.FINISHED_ABORTED)
++    now[0] += 44
++    scheduler.schedule()
++    assert calls == [False]
++    now[0] += 1.5
++    scheduler.schedule()
++    assert calls == [False, True]
++    now[0] += 100
++    scheduler.schedule()
++    assert calls == [False, True]
++
++
+ def test_preemption_re_records_prefix_cache_query():
+     """A preempted request re-enters the lookup on resume, so its recomputation
+     is counted again into the preempted stats."""
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 20f69fc..76453f8 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -458,6 +458,12 @@ if TYPE_CHECKING:
+     # for A/B. AOT: no. CAPTURE: no -- scheduler-side block bookkeeping only;
+     # the worker sees the same block tables either way.
+     VLLM_E2_MAMBA_RETAIN_CHECKPOINT: bool = True
++    # (local 2026-10-22) Adaptive retention: with retention on, the scheduler
++    # drops every held checkpoint as soon as a request cannot get blocks (a
++    # capacity queue or a decode step that would preempt) and holds new ones
++    # again only after this many seconds without such a failure. 0 = static
++    # retention (the v2.5 behaviour). Scheduler-side only. AOT: no. CAPTURE: no.
++    VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S: float = 0.0
+     # v2.5 side-cache layout (Flash-Next PLE + QSA ring): stop charging each
+     # tiny side cache a whole packed pool block per request. The TP-replicated
+     # PLE short-conv state group is folded into a GDN group that has a spare
+@@ -951,6 +957,20 @@ def _resolve_rust_cli_path() -> str | None:
+     return raw
+ 
+ 
++def _e2_nonneg_seconds(name: str) -> float:
++    """A non-negative, finite number of seconds; unset or "0" means off."""
++    raw = os.environ.get(name)
++    if raw is None:
++        return 0.0
++    try:
++        value = float(raw)
++    except ValueError:
++        value = -1.0
++    if not (0.0 <= value < float("inf")):
++        raise ValueError(f"{name} must be a non-negative number of seconds, got {raw!r}")
++    return value
++
++
+ def _e2_strict_switch(name: str, default: bool = False) -> bool:
+     """Parse a fork on/off switch that accepts exactly ``"0"`` and ``"1"``.
+ 
+@@ -2648,6 +2668,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_E2_MAMBA_RETAIN_CHECKPOINT": lambda: _e2_strict_switch(
+         "VLLM_E2_MAMBA_RETAIN_CHECKPOINT", default=True
+     ),
++    # Adaptive retention hold-off in seconds (local; 0 = off). Read by the scheduler.
++    "VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S": lambda: _e2_nonneg_seconds(
++        "VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S"
++    ),
+     # Side-cache layout (v2.5; PLE state folded into a GDN group + QSA ring slot
+     # packing), default ON. Strict "0"/"1"; read once per get_kv_cache_configs call.
+     "VLLM_E2_SIDE_CACHE_LAYOUT": lambda: _e2_strict_switch(
+@@ -2932,6 +2956,7 @@ def compile_factors() -> dict[str, object]:
+         # compiled and the worker's tables are identical in both worlds, so an
+         # A/B flip must reuse the same AOT cache.
+         "VLLM_E2_MAMBA_RETAIN_CHECKPOINT",
++        "VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S",
+         # Boot-failure policy of a host-side profiling-teardown check; read by no
+         # compiled code.
+         "VLLM_FAIL_ON_PROFILING_KV_LEAK",
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index c07cd8a..8338075 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -990,6 +990,19 @@ class KVCacheManager:
+         self.block_pool.free_blocks(reversed(blocks))
+         return len(blocks)
+ 
++    def set_checkpoint_retention(self, on: bool) -> int:
++        """(local 2026-10-22) Switch Mamba prefix-checkpoint retention at
++        runtime (adaptive retention). Switching off frees every held
++        checkpoint into the cached free queue; returns the number of blocks
++        released."""
++        released: list[KVCacheBlock] = []
++        for manager in self.coordinator.single_type_managers:
++            if isinstance(manager, MambaManager):
++                released.extend(manager.set_checkpoint_retention(on))
++        if released:
++            self.block_pool.free_blocks(released)
++        return len(released)
++
+     def yield_pinned_hits(
+         self, keep: str | None = None, limit: int | None = None
+     ) -> int:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 3e60c91..1461017 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -9,6 +9,7 @@ from dataclasses import replace
+ from typing import Any
+ 
+ from vllm.compilation.cuda_graph import CUDAGraphStat
++from vllm import envs
+ from vllm.config import KVEventsConfig, VllmConfig
+ from vllm.distributed.ec_transfer.ec_connector.base import (
+     ECConnectorBase,
+@@ -234,6 +235,14 @@ class Scheduler(SchedulerInterface):
+         # (local 2026-10-22) requests whose connector lookup was deferred in the
+         # last pass; they stay in `waiting` in arrival order (stats only).
+         self._num_deferred_waiting = 0
++        # (local 2026-10-22) Adaptive Mamba checkpoint retention: held
++        # checkpoints cost each running request ~one block per GDN group and
++        # only pay off when the GPU cache is not churning. They are dropped at
++        # the first capacity failure and held again after this many seconds
++        # without one (0 = static retention).
++        self._retain_adaptive_s = envs.VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S
++        self._last_capacity_failure: float | None = None
++        self._retention_on = True
+         self.running: list[Request] = []
+ 
+         # The request IDs that are finished in between the previous and the
+@@ -615,6 +624,40 @@ class Scheduler(SchedulerInterface):
+                 continue
+             manager.pin_waiting_hit(request)
+ 
++    def _on_capacity_failure(self) -> bool:
++        """(local 2026-10-22) A request could not get blocks. With adaptive
++        retention, stop holding Mamba checkpoints and free the held ones.
++        Returns whether any block was released (worth retrying now)."""
++        if self._retain_adaptive_s <= 0:
++            return False
++        self._last_capacity_failure = time.monotonic()
++        if not self._retention_on:
++            return False
++        self._retention_on = False
++        released = self.kv_cache_manager.set_checkpoint_retention(False)
++        logger.info(
++            "Adaptive retention: off (capacity queue), released %d checkpoint "
++            "blocks",
++            released,
++        )
++        return released > 0
++
++    def _maybe_resume_retention(self) -> None:
++        """Hold checkpoints again after VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S seconds
++        without a capacity failure."""
++        if (
++            self._retention_on
++            or self._last_capacity_failure is None
++            or time.monotonic() - self._last_capacity_failure < self._retain_adaptive_s
++        ):
++            return
++        self._retention_on = True
++        self.kv_cache_manager.set_checkpoint_retention(True)
++        logger.info(
++            "Adaptive retention: on (no capacity queue for %.0f s)",
++            self._retain_adaptive_s,
++        )
++
+     def _get_local_prefix_cache_hit(
+         self, request: Request
+     ) -> tuple[KVCacheBlocks, int, int, bool]:
+@@ -650,6 +693,8 @@ class Scheduler(SchedulerInterface):
+ 
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         self.current_step += 1
++        if self._retain_adaptive_s > 0:
++            self._maybe_resume_retention()
+         # NOTE(woosuk) on the scheduling algorithm:
+         # There's no "decoding phase" nor "prefill phase" in the scheduler.
+         # Each request just has the num_computed_tokens and
+@@ -838,6 +883,11 @@ class Scheduler(SchedulerInterface):
+                     if self.kv_cache_manager.yield_pinned_hits(limit=1):
+                         continue
+ 
++                    # Held Mamba checkpoints go before anyone is preempted
++                    # (adaptive retention); retry with them in the free queue.
++                    if self._on_capacity_failure():
++                        continue
++
+                     # The request cannot be scheduled.
+                     # Preempt the lowest-priority request.
+                     if self.policy == SchedulingPolicy.PRIORITY:
+@@ -1386,6 +1436,9 @@ class Scheduler(SchedulerInterface):
+                     # manager
+                     if request.has_encoder_inputs:
+                         self.encoder_cache_manager.free(request)
++                    # A capacity queue: adaptive retention lets go of the held
++                    # checkpoints (the head is retried next step).
++                    self._on_capacity_failure()
+                     break
+ 
+                 # KVTransfer: the connector uses this info to determine
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 810d11c..38acc04 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1700,11 +1700,14 @@ class MambaManager(SingleTypeKVCacheManager):
+         # retention on, the newest hashed retired state stays referenced here
+         # (at most one per request per group) and is released only when the
+         # request is freed, after its attention blocks (coordinator.free).
+-        self._retain_checkpoint: bool = (
++        self._retain_allowed: bool = (
+             self.mamba_cache_mode == "align"
+             and self.enable_caching
+             and envs.VLLM_E2_MAMBA_RETAIN_CHECKPOINT
+         )
++        # (local 2026-10-22) switched at runtime by the scheduler's adaptive
++        # retention (set_checkpoint_retention); starts as configured.
++        self._retain_checkpoint: bool = self._retain_allowed
+         # {request_id: (hashed token position, block)}: the newest hashed
+         # state the request resumed from or produced, held with one ref of
+         # its own (ordered by ``block_hash_num_tokens`` rather than
+@@ -1835,6 +1838,21 @@ class MambaManager(SingleTypeKVCacheManager):
+         held = self._retained_checkpoints.pop(request_id, None)
+         return [] if held is None else [held[1]]
+ 
++    def set_checkpoint_retention(self, on: bool) -> list[KVCacheBlock]:
++        """(local 2026-10-22) Switch retention at runtime (only where it is
++        configured on). Switching off pops every held checkpoint and returns
++        the blocks for the caller to free: they become ordinary cached free
++        blocks, hit-able until evicted, as after a request finishes. Switching
++        on lets requests hold their next retired state again."""
++        if not self._retain_allowed or on == self._retain_checkpoint:
++            return []
++        self._retain_checkpoint = on
++        if on:
++            return []
++        released = [block for _, block in self._retained_checkpoints.values()]
++        self._retained_checkpoints.clear()
++        return released
++
+     def get_num_retained_checkpoint_blocks_to_reserve(
+         self,
+         request_id: str,
+-- 
+2.53.0
+

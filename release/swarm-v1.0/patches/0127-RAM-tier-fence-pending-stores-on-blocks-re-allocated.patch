@@ -1,0 +1,39 @@
+From 277ca12e4d4c7808dac93703789d0d29cf8bd224 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 13:50:01 +0300
+Subject: [PATCH 127/138] RAM tier: fence pending stores on blocks re-allocated
+ to any KV group
+
+Every group draws from one block pool and a finished request's blocks are freed
+at once, with stores still in flight (or created on the next step). The flush on
+re-allocation only saw blocks handed to offloaded groups, so a block given to a
+non-offloaded group (QSA ring, DFlash drafter window) could be overwritten
+before its copy to the CPU tier ran. Collect new blocks of all groups.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kv_transfer/kv_connector/v1/offloading/scheduler.py   | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index beada02..1b7e6fd 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -1373,8 +1373,12 @@ class OffloadingConnectorScheduler:
+                         for grp_idx in self._sliding_window_groups
+                     )
+                 req_status.update_block_id_groups(new_block_id_groups)
+-                for group_config in self.config.kv_group_configs:
+-                    new_blocks = new_block_id_groups[group_config.group_idx]
++                # local 2026-10-22: every KV group draws from the one block pool, so a
++                # block a finished request is still storing to the offload tier can be
++                # re-allocated to a group that is NOT offloaded (QSA ring, drafter
++                # window) and overwritten before the copy ran. Fence on new blocks of
++                # all groups, not only the offloaded ones.
++                for new_blocks in new_block_id_groups:
+                     for bid in new_blocks:
+                         if bid != 0:
+                             self._current_batch_allocated_block_ids.add(bid)
+-- 
+2.53.0
+

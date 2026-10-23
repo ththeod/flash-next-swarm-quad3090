@@ -1,0 +1,53 @@
+From 4c3a25507520820aea0472e4e2894b24d8cc890d Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 17:41:41 +0300
+Subject: [PATCH 101/138] exp: DFlash on Qwen4Exp: allow method dflash in the
+ Qwen4Exp guard; dense drafter does not inherit enable_expert_parallel
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/config/speculative.py           | 9 +++++++++
+ vllm/model_executor/models/config.py | 3 +++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 2396b26..cdfbc87 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1551,6 +1551,15 @@ class SpeculativeConfig:
+                         self.target_parallel_config, self.draft_tensor_parallel_size
+                     )
+                 )
++                # local (DFlash 2 experiment): a dense drafter (DFlash/EAGLE head)
++                # on an expert-parallel MoE target would otherwise inherit
++                # enable_expert_parallel and fail ModelConfig's "number of experts
++                # must be > 0" check. The drafter has no MoE layers, so EP is moot.
++                if (
++                    self.draft_parallel_config.enable_expert_parallel
++                    and not self.draft_model_config.is_moe
++                ):
++                    self.draft_parallel_config.enable_expert_parallel = False
+ 
+         if self.index_share_for_mtp_iteration is not None:
+             if self.method != "mtp" or self.draft_model_config is None:
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index 5c55412..ee28bb6 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -899,10 +899,13 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
+         if multimodal_config is not None and multimodal_config.language_model_only:
+             _strip_qwen4_exp_mrope(vllm_config.model_config)
+         spec_config = vllm_config.speculative_config
++        # local (DFlash 2 experiment): "dflash" reads the aux hidden states that
++        # Qwen4ExpModel now captures (EagleModelMixin, relayed over PP).
+         if spec_config is not None and spec_config.method not in {
+             "mtp",
+             "ngram",
+             "ngram_gpu",
++            "dflash",
+         }:
+             raise NotImplementedError(
+                 "Qwen4Exp speculative decoding supports only its native MTP "
+-- 
+2.53.0
+

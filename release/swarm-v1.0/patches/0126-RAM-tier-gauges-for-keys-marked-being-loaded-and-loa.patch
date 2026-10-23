@@ -1,0 +1,62 @@
+From 89c174797b6a9360ff8f541b758faee290ddcdc5 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 13:29:17 +0300
+Subject: [PATCH 126/138] RAM tier: gauges for keys marked being-loaded and
+ load jobs in flight
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kv_transfer/kv_connector/v1/offloading/metrics.py  |  8 ++++++++
+ .../kv_connector/v1/offloading/scheduler.py            | 10 ++++++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py
+index caa2522..6d069d9 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py
+@@ -46,6 +46,8 @@ class _ConnectorMetricName:
+     DEFER_BACKEND_PENDING = "vllm:kv_offload_defer_backend_pending"
+     DEFER_BEING_LOADED = "vllm:kv_offload_defer_being_loaded"
+     DEFER_TAIL_PENDING = "vllm:kv_offload_defer_tail_pending"
++    CHUNKS_BEING_LOADED = "vllm:kv_offload_chunks_being_loaded"
++    LOAD_JOBS_IN_FLIGHT = "vllm:kv_offload_load_jobs_in_flight"
+ 
+ 
+ class _TransferType:
+@@ -160,6 +162,12 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
+         _ConnectorMetricName.DEFER_TAIL_PENDING: OffloadingCounterMetadata(
+             documentation="Lookups deferred: a partial-tail checkpoint is not ready yet.",
+         ),
++        _ConnectorMetricName.CHUNKS_BEING_LOADED: OffloadingGaugeMetadata(
++            documentation="Offload keys currently marked as being loaded.",
++        ),
++        _ConnectorMetricName.LOAD_JOBS_IN_FLIGHT: OffloadingGaugeMetadata(
++            documentation="Load jobs created and not yet completed on every worker.",
++        ),
+     }
+ 
+ 
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 461ba67..beada02 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -2060,6 +2060,16 @@ class OffloadingConnectorScheduler:
+ 
+     def get_stats(self) -> OffloadingConnectorStats | None:
+         stats: OffloadingConnectorStats | None = None
++        # local: expose lookup-deferral state (a load that never completes keeps its
++        # keys marked, deferring every request that needs them)
++        self._connector_stats.set_gauge(
++            _ConnectorMetricName.CHUNKS_BEING_LOADED,
++            len(self._chunks_being_loaded or ()),
++        )
++        self._connector_stats.set_gauge(
++            _ConnectorMetricName.LOAD_JOBS_IN_FLIGHT,
++            sum(1 for job in self._jobs.values() if not job.is_store),
++        )
+         if not self._connector_stats.is_empty():
+             stats = self._connector_stats
+             self._connector_stats = OffloadingConnectorStats()
+-- 
+2.53.0
+

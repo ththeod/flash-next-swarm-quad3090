@@ -1,0 +1,79 @@
+From 15bbcac55192723c37b923515f55a01680f1050b Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 03:43:16 +0300
+Subject: [PATCH 134/138] VLLM_EXP_QSA_FP4_WARPS: warp floor for the FP4 QSA
+ sparse kernel (tuned prefill profile runs 1 warp, FP4 int32 tiles spill: 57x
+ slower than FP8); applied in _select_config so warmup compiles the same
+ variant
+
+(cherry picked from commit fdab898c4d7ae0da7c819818dc08f61eb2c40eee)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/models/qwen4_exp/nvidia/ops/qsa.py | 22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index c5cb88c..73979e0 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -85,6 +85,11 @@ def _encode_e4m3(x):
+     return tl.where(exp < -6, sub, normal).to(tl.uint8)
+ 
+ 
++import os as _os
++
++_QSA_FP4_WARPS = int(_os.environ.get("VLLM_EXP_QSA_FP4_WARPS", "0"))
++
++
+ @triton.jit
+ def _decode_e2m1_bf16(nib):
+     """4-bit E2M1 code (sign bit 3) -> BF16 {0, .5, 1, 1.5, 2, 3, 4, 6} x sign, built
+@@ -739,7 +744,11 @@ def _compress_qsa_groups_kernel(
+ 
+ 
+ def _select_config(
+-    num_rows: int, num_kv_heads: int, use_prefill_config: bool, num_columns: int
++    num_rows: int,
++    num_kv_heads: int,
++    use_prefill_config: bool,
++    num_columns: int,
++    kv_fp4: bool = False,
+ ) -> tuple[int, int, int, int]:
+     """Select (block_n, num_warps, num_tiles, num_splits) for the kernel.
+ 
+@@ -767,6 +776,11 @@ def _select_config(
+         BLOCK_N, target_splits, num_warps = 64, 4, 2
+     else:
+         BLOCK_N, target_splits, num_warps = 64, 1, 2
++    if kv_fp4 and _QSA_FP4_WARPS:
++        # local: the FP4 decode keeps int32 [HEAD_DIM x BLOCK_N] tiles live; with the
++        # tuned single-warp prefill profile they spill registers (FP4 prefill 57x
++        # slower in this kernel than FP8, W12b). VLLM_EXP_QSA_FP4_WARPS sets a floor.
++        num_warps = max(num_warps, _QSA_FP4_WARPS)
+     num_tiles = triton.cdiv(num_columns, BLOCK_N)
+     # Never more splits than tiles, never empty.
+     num_splits = min(target_splits, num_tiles)
+@@ -896,7 +910,7 @@ def qsa_sparse_paged_attention(
+     block_m = triton.next_power_of_2(group_size)
+     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
+     block_n, partial_warps, num_tiles, num_splits = _select_config(
+-        q.shape[0], k_cache.shape[2], use_prefill_config, selection_width
++        q.shape[0], k_cache.shape[2], use_prefill_config, selection_width, kv_fp4
+     )
+     if _force_num_warps is not None:
+         partial_warps = _force_num_warps
+@@ -1006,7 +1020,9 @@ def warmup_qsa_sparse_paged_attention(
+ 
+     # Every config the dispatch can pick for this group size.
+     profiles = {
+-        _select_config(num_rows, num_kv_heads, use_prefill_config, selection_width)
++        _select_config(
++            num_rows, num_kv_heads, use_prefill_config, selection_width, kv_fp4
++        )
+         for num_rows in range(1, 8193)
+         for use_prefill_config in (False, True)
+     }
+-- 
+2.53.0
+

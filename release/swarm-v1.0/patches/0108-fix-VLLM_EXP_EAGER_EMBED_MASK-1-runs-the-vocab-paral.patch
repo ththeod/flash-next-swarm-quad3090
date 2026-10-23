@@ -1,0 +1,59 @@
+From dc9306170e8fca889c06b8211ccf77cfe5211e77 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 21:47:18 +0300
+Subject: [PATCH 108/138] fix: VLLM_EXP_EAGER_EMBED_MASK=1 runs the
+ vocab-parallel embedding's id masking eagerly (runtime torch.compile
+ recompile on PP0 deadlocked with 7-draft DFlash + RAM tier)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../layers/vocab_parallel_embedding.py        | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index 01a4809..a16f9ba 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -259,6 +259,21 @@ def get_masked_input_and_mask(
+     return input_, ~vocab_mask
+ 
+ 
++# local: VLLM_EXP_EAGER_EMBED_MASK=1 runs the token-id masking above eagerly. Its
++# torch.compile(dynamic=True) still specializes token counts 0/1, so a step with an
++# unseen count (seen with 7-draft DFlash + RAM-tier resumes) recompiles mid-inference
++# on PP rank 0; loading the new kernel there deadlocked against work already in
++# flight (2026-10-20, exp-w6-stacks.txt). A few pointwise ops over <= max batched
++# tokens ids: nothing to gain from compiling them.
++_EAGER_EMBED_MASK = os.environ.get("VLLM_EXP_EAGER_EMBED_MASK", "0") == "1"
++
++
++def _masked_input_and_mask(*args) -> tuple[torch.Tensor, torch.Tensor]:
++    if _EAGER_EMBED_MASK:
++        return get_masked_input_and_mask.__wrapped__(*args)
++    return get_masked_input_and_mask(*args)
++
++
+ # --8<-- [start:vocab_parallel_embedding]
+ @PluggableLayer.register("vocab_parallel_embedding")
+ class VocabParallelEmbedding(PluggableLayer):
+@@ -585,7 +600,7 @@ class VocabParallelEmbedding(PluggableLayer):
+                     *input_.shape, self.embedding_dim
+                 )
+         else:
+-            masked_input, input_mask = get_masked_input_and_mask(
++            masked_input, input_mask = _masked_input_and_mask(
+                 input_,
+                 self.shard_indices.org_vocab_start_index,
+                 self.shard_indices.org_vocab_end_index,
+@@ -725,7 +740,7 @@ class PinnedHostVocabParallelEmbedding(VocabParallelEmbedding):
+                 self._lookup_weight(input_),
+             )
+ 
+-        masked_input, input_mask = get_masked_input_and_mask(
++        masked_input, input_mask = _masked_input_and_mask(
+             input_,
+             self.shard_indices.org_vocab_start_index,
+             self.shard_indices.org_vocab_end_index,
+-- 
+2.53.0
+

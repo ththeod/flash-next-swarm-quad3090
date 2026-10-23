@@ -1,0 +1,402 @@
+From 815825dfbb3443ce86482a64351823e69f588565 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 10:35:45 +0300
+Subject: [PATCH 114/138] VLLM_EXP_SKINNY_SM86=1: Triton skinny decode GEMM for
+ sm_86 (3090) bf16 linears
+
+Decode/verify GEMMs (8-64 rows) are memory-bound; cuBLAS picked 16x16 wmma and
+split-K + reduce kernels at ~2.7x the bandwidth floor (W12 profile). One program
+per (N tile, K split), tensor-core dot with M padded; split-K partials are summed
+in fixed order by the last-arriving split (per-tile counter, reset in-kernel):
+deterministic, one launch. Per-layer scratch slots. Plans per local (N, K) and
+M bucket from VLLM_EXP_SKINNY_SM86_PLANS (tuned by /opt/flash-next/skinny/bench.py,
+kept only where >= 5% faster than cuBLAS); everything else keeps F.linear.
+
+Hooked into enable_qwen4_exp_low_latency_gemm (target model) and the DFlash 2
+drafter. Both env vars are registered in envs.py so they enter the compile/AOT
+cache key. apply() always calls the op: a token-count test there is evaluated
+once at trace time and baked the fallback into the compiled graph (W20/W21).
+CPU/meta weights (PLE offload process) are skipped.
+
+W22 (p3b config, 16 slots): greedy single-request decode +9/+16/+10%
+(code/prose/count), prefill unchanged, 2-12 requests +6-18%, 16 requests flat;
+per-step compute at N=1 24.0 -> 20.7 ms. NaN poke clean, probes 8/8, GSM8K 97.0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/envs.py                                  |   8 +
+ vllm/model_executor/models/qwen3_dflash2.py   |   3 +
+ .../qwen4_exp/nvidia/low_latency_gemm.py      |   5 +
+ .../qwen4_exp/nvidia/ops/skinny_sm86.py       | 304 ++++++++++++++++++
+ 4 files changed, 320 insertions(+)
+ create mode 100644 vllm/models/qwen4_exp/nvidia/ops/skinny_sm86.py
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 0812063..6b5960d 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -2391,6 +2391,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # logging of workspace resize operations.
+     "VLLM_DEBUG_WORKSPACE": lambda: bool(int(os.getenv("VLLM_DEBUG_WORKSPACE", "0"))),
+     # Disables parallel execution of shared_experts via separate cuda stream
++    # Qwen4Exp sm_86 skinny decode GEMM (models/qwen4_exp/nvidia/ops/skinny_sm86.py).
++    # Registered so both values enter the torch.compile / AOT cache key: they
++    # decide which linears trace through the skinny op. Plans: rename the file
++    # when its contents change.
++    "VLLM_EXP_SKINNY_SM86": lambda: os.getenv("VLLM_EXP_SKINNY_SM86", "0"),
++    "VLLM_EXP_SKINNY_SM86_PLANS": lambda: os.getenv(
++        "VLLM_EXP_SKINNY_SM86_PLANS", "/opt/flash-next/skinny/plans-sm86.json"
++    ),
+     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
+         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
+     ),
+diff --git a/vllm/model_executor/models/qwen3_dflash2.py b/vllm/model_executor/models/qwen3_dflash2.py
+index cb02729..c5a7411 100644
+--- a/vllm/model_executor/models/qwen3_dflash2.py
++++ b/vllm/model_executor/models/qwen3_dflash2.py
+@@ -278,6 +278,9 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
+             scale=float(draft_config.get("output_multiplier", 1.0)),
+             soft_cap=softcap if softcap > 0 else None,
+         )
++        from vllm.models.qwen4_exp.nvidia.ops import skinny_sm86
++
++        skinny_sm86.enable(self, vllm_config.model_config.dtype, "dflash2")
+ 
+     def compute_candidates(
+         self, hidden_states: torch.Tensor
+diff --git a/vllm/models/qwen4_exp/nvidia/low_latency_gemm.py b/vllm/models/qwen4_exp/nvidia/low_latency_gemm.py
+index c177f07..31bd7fe 100644
+--- a/vllm/models/qwen4_exp/nvidia/low_latency_gemm.py
++++ b/vllm/models/qwen4_exp/nvidia/low_latency_gemm.py
+@@ -23,6 +23,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+ from vllm.platforms import current_platform
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
++from .ops import skinny_sm86
++
+ QWEN4_EXP_GEMM_PLANS: dict[tuple[int, int], dict[int, SkinnyGemmConfig]] = {
+     # GDN fused QKVZ projection, TP=4.
+     (4096, 2560): {
+@@ -229,6 +231,9 @@ def enable_qwen4_exp_low_latency_gemm(
+     module: nn.Module,
+     dtype: torch.dtype,
+ ) -> None:
++    if skinny_sm86.is_supported():
++        skinny_sm86.enable(module, dtype, type(module).__name__)
++        return
+     plans = _gemm_plans()
+     if dtype != torch.bfloat16 or not plans:
+         return
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/skinny_sm86.py b/vllm/models/qwen4_exp/nvidia/ops/skinny_sm86.py
+new file mode 100644
+index 0000000..44333f6
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/ops/skinny_sm86.py
+@@ -0,0 +1,304 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Skinny bf16 decode GEMM for Ampere (sm_86), VLLM_EXP_SKINNY_SM86=1.
++
++Decode and speculative verification run the dense projections for 8-64 token
++rows, so every GEMM reads its whole weight once and is bound by memory
++bandwidth. On the 3090s cuBLAS picks 16x16 wmma tiles and split-K + reduce
++kernels that take ~2.7x the bandwidth floor (2026-10-21 decode profile).
++
++Y[M, N] = X[M, K] @ W[N, K]^T: one program per (N tile, K split), tensor-core
++dot with M padded to BLOCK_M. With SPLIT_K > 1 every split stores an fp32
++partial and the last split to arrive (per-tile counter) sums them in fixed
++order and resets the counter: deterministic, one launch. Every enabled layer
++owns its counters and partials (a "slot"), so layers on different streams
++never share them.
++
++Plans are measured per local (N, K) shape and M bucket by
++/opt/flash-next/skinny/bench.py and read from VLLM_EXP_SKINNY_SM86_PLANS
++(JSON); shapes and M without a plan, and M > 64, keep F.linear.
++"""
++
++import json
++import os
++
++import torch
++from torch import nn
++
++from vllm.logger import init_logger
++from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    UnquantizedEmbeddingMethod,
++)
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import direct_register_custom_op
++
++logger = init_logger(__name__)
++
++ENABLED = os.environ.get("VLLM_EXP_SKINNY_SM86", "0") == "1"
++PLANS_PATH = os.environ.get(
++    "VLLM_EXP_SKINNY_SM86_PLANS", "/opt/flash-next/skinny/plans-sm86.json"
++)
++M_BUCKETS = (8, 16, 32, 48, 64)
++
++
++@triton.jit
++def _fence_gpu(x):
++    # fence.acq_rel.gpu in every thread: orders this thread's partial stores
++    # (or the reads that follow) with the arrival counter at GPU scope.
++    return tl.inline_asm_elementwise(
++        "fence.acq_rel.gpu;\n\tmov.b32 $0, $1;",
++        "=r,r",
++        [x],
++        dtype=tl.int32,
++        is_pure=False,
++        pack=1,
++    )
++
++
++@triton.jit
++def _skinny_gemm_kernel(
++    x_ptr,
++    w_ptr,
++    y_ptr,
++    ws_ptr,
++    cnt_ptr,
++    M,
++    N,
++    K,
++    stride_xm,
++    stride_wn,
++    stride_ym,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    SPLIT_K: tl.constexpr,
++):
++    pid_n = tl.program_id(0)
++    pid_k = tl.program_id(1)
++    offs_m = tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    offs_k = tl.arange(0, BLOCK_K)
++    k_len = K // SPLIT_K
++    k0 = pid_k * k_len
++    m_mask = offs_m < M
++    n_mask = offs_n < N
++    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + (k0 + offs_k)[None, :]
++    w_ptrs = w_ptr + offs_n[:, None] * stride_wn + (k0 + offs_k)[None, :]
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    for _ in range(0, k_len, BLOCK_K):
++        x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
++        w = tl.load(
++            w_ptrs, mask=n_mask[:, None], other=0.0, eviction_policy="evict_first"
++        )
++        acc = tl.dot(x, tl.trans(w), acc)
++        x_ptrs += BLOCK_K
++        w_ptrs += BLOCK_K
++    y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :]
++    y_mask = m_mask[:, None] & n_mask[None, :]
++    if SPLIT_K == 1:
++        tl.store(y_ptrs, acc.to(y_ptr.dtype.element_ty), mask=y_mask)
++    else:
++        offs_t = offs_m[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
++        tile = ws_ptr + pid_n * (SPLIT_K * BLOCK_M * BLOCK_N)
++        tl.store(tile + pid_k * (BLOCK_M * BLOCK_N) + offs_t, acc)
++        f = _fence_gpu(tl.full([1], 0, tl.int32))
++        tl.debug_barrier()
++        arrived = tl.atomic_add(
++            cnt_ptr + pid_n + tl.sum(f, 0), 1, sem="acq_rel", scope="gpu"
++        )
++        if arrived == SPLIT_K - 1:
++            f2 = _fence_gpu(tl.full([1], 0, tl.int32))
++            tile += tl.sum(f2, 0)
++            total = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++            for s in tl.static_range(SPLIT_K):
++                total += tl.load(
++                    tile + s * (BLOCK_M * BLOCK_N) + offs_t, cache_modifier=".cg"
++                )
++            tl.store(y_ptrs, total.to(y_ptr.dtype.element_ty), mask=y_mask)
++            tl.atomic_xchg(cnt_ptr + pid_n, 0, sem="relaxed", scope="gpu")
++
++
++# (block_m, block_n, block_k, split_k, num_warps, num_stages)
++Config = tuple[int, int, int, int, int, int]
++
++
++def launch(
++    x: torch.Tensor,
++    w: torch.Tensor,
++    cfg: Config,
++    ws: torch.Tensor,
++    cnt: torch.Tensor,
++    out: torch.Tensor | None = None,
++) -> torch.Tensor:
++    bm, bn, bk, sk, warps, stages = cfg
++    m, k = x.shape
++    n = w.shape[0]
++    y = out if out is not None else x.new_empty((m, n))
++    _skinny_gemm_kernel[(triton.cdiv(n, bn), sk)](
++        x,
++        w,
++        y,
++        ws,
++        cnt,
++        m,
++        n,
++        k,
++        x.stride(0),
++        w.stride(0),
++        y.stride(0),
++        BLOCK_M=bm,
++        BLOCK_N=bn,
++        BLOCK_K=bk,
++        SPLIT_K=sk,
++        num_warps=warps,
++        num_stages=stages,
++    )
++    return y
++
++
++def scratch_size(cfg: Config, n: int) -> tuple[int, int]:
++    """fp32 partial elements and counters a config needs for N columns."""
++    bm, bn, _, sk, _, _ = cfg
++    if sk == 1:
++        return 0, 0
++    tiles = triton.cdiv(n, bn)
++    return tiles * sk * bm * bn, tiles
++
++
++def m_bucket(m: int) -> int | None:
++    for b in M_BUCKETS:
++        if m <= b:
++            return b
++    return None
++
++
++_plans: dict[tuple[int, int], dict[int, Config]] | None = None
++# slot -> (weight shape, plan by M bucket, fp32 partials, int32 counters)
++_slots: list[tuple[tuple[int, int], dict[int, Config], torch.Tensor, torch.Tensor]] = []
++
++
++def load_plans() -> dict[tuple[int, int], dict[int, Config]]:
++    global _plans
++    if _plans is None:
++        _plans = {}
++        try:
++            with open(PLANS_PATH) as f:
++                raw = json.load(f)
++        except OSError:
++            logger.warning("skinny sm86: no plan file %s", PLANS_PATH)
++            raw = {}
++        for key, by_m in raw.items():
++            n, k = (int(v) for v in key.split("x"))
++            _plans[(n, k)] = {int(m): tuple(c) for m, c in by_m.items()}
++    return _plans
++
++
++def is_supported() -> bool:
++    return ENABLED and current_platform.is_device_capability((8, 6))
++
++
++def _gemm(x: torch.Tensor, weight: torch.Tensor, slot: int) -> torch.Tensor:
++    shape, plan, ws, cnt = _slots[slot]
++    cfg = plan.get(m_bucket(x.shape[0]) or 0)
++    if (
++        cfg is None
++        or x.dim() != 2
++        or x.dtype != torch.bfloat16
++        or x.stride(1) != 1
++        or weight.stride(1) != 1
++        or tuple(weight.shape) != shape
++    ):
++        return torch.nn.functional.linear(x, weight)
++    return launch(x, weight, cfg, ws, cnt)
++
++
++def _gemm_fake(x: torch.Tensor, weight: torch.Tensor, slot: int) -> torch.Tensor:
++    return x.new_empty((*x.shape[:-1], weight.shape[0]))
++
++
++direct_register_custom_op(
++    op_name="qwen4_exp_skinny_sm86_gemm",
++    op_func=_gemm,
++    fake_impl=_gemm_fake,
++)
++
++
++class _SkinnyApply:
++    slot: int
++
++    def apply(
++        self,
++        layer: nn.Module,
++        x: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        # No token-count test here: torch.compile would evaluate it once while
++        # tracing (with a large example batch) and bake in the fallback. The op
++        # picks skinny vs F.linear per call at run time.
++        if bias is None and x.dim() == 2:
++            return torch.ops.vllm.qwen4_exp_skinny_sm86_gemm(x, layer.weight, self.slot)
++        return super().apply(layer, x, bias)  # type: ignore[misc]
++
++
++class SkinnyLinearMethod(_SkinnyApply, UnquantizedLinearMethod):
++    def __init__(self, slot: int):
++        super().__init__()
++        self.slot = slot
++
++
++class SkinnyEmbeddingMethod(_SkinnyApply, UnquantizedEmbeddingMethod):
++    def __init__(self, slot: int):
++        super().__init__()
++        self.slot = slot
++
++
++def enable(module: nn.Module, dtype: torch.dtype, tag: str) -> None:
++    """Route this module tree's bf16 linears and LM head through the skinny
++    GEMM where a plan exists; logs every eligible shape either way."""
++    if dtype != torch.bfloat16 or not is_supported():
++        return
++    plans = load_plans()
++    seen: dict[tuple[int, int], list[int]] = {}
++    for child in module.modules():
++        is_linear = (
++            isinstance(child, LinearBase)
++            and type(child.quant_method) is UnquantizedLinearMethod
++        )
++        is_head = (
++            isinstance(child, ParallelLMHead)
++            and type(child.quant_method) is UnquantizedEmbeddingMethod
++        )
++        if not (is_linear or is_head):
++            continue
++        weight = getattr(child, "weight", None)
++        if weight is None or weight.dim() != 2:
++            continue
++        shape = (int(weight.shape[0]), int(weight.shape[1]))
++        counts = seen.setdefault(shape, [0, 0])
++        counts[0] += 1
++        plan = plans.get(shape)
++        # CPU / meta weights (the PLE offload process builds the model with
++        # CUDA disabled) keep the standard path.
++        if not plan or weight.device.type != "cuda":
++            continue
++        counts[1] += 1
++        ws_elems = max(scratch_size(c, shape[0])[0] for c in plan.values())
++        tiles = max(scratch_size(c, shape[0])[1] for c in plan.values())
++        ws = torch.empty(max(ws_elems, 1), dtype=torch.float32, device=weight.device)
++        cnt = torch.zeros(max(tiles, 1), dtype=torch.int32, device=weight.device)
++        _slots.append((shape, plan, ws, cnt))
++        slot = len(_slots) - 1
++        child.quant_method = (
++            SkinnyLinearMethod(slot) if is_linear else SkinnyEmbeddingMethod(slot)
++        )
++    logger.info(
++        "skinny sm86 (%s): %s",
++        tag,
++        ", ".join(
++            f"{n}x{k}: {on}/{tot}" for (n, k), (tot, on) in sorted(seen.items())
++        )
++        or "no eligible linears",
++    )
+-- 
+2.53.0
+

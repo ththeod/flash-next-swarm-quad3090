@@ -1,0 +1,72 @@
+From 9602def8228365b0c7d5eb459c6d91d86a22e419 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 02:47:28 +0300
+Subject: [PATCH 133/138] fp4 perf: E2M1 decode built bit by bit in BF16 (was
+ exp2 + fp32 per element; FP4 prefill ran ~4.5x slower than FP8 in W12 G1R).
+ Bit-identical: all 16 codes match, every E2M1 x E4M3 product is exact in BF16
+
+(cherry picked from commit ff3b4824d809b73584ed66cf1caf1c9b016fdef9)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/models/qwen4_exp/nvidia/ops/qsa.py | 28 +++++++++++++------------
+ 1 file changed, 15 insertions(+), 13 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index a5cf51e..c5cb88c 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -86,13 +86,21 @@ def _encode_e4m3(x):
+ 
+ 
+ @triton.jit
+-def _decode_e2m1(nib):
+-    """4-bit E2M1 code (sign bit 3) -> fp32 in {0, .5, 1, 1.5, 2, 3, 4, 6} x sign."""
++def _decode_e2m1_bf16(nib):
++    """4-bit E2M1 code (sign bit 3) -> BF16 {0, .5, 1, 1.5, 2, 3, 4, 6} x sign, built
++    bit by bit like _decode_e4m3_to_bf16 (the first version used exp2 and fp32 per
++    element, which made FP4 prefill ~4.5x slower: every query token decodes its 2048
++    selected keys and values). Exact: the value is 2^(e-1) * (1 + m/2) for e > 0
++    (BF16 exponent 126 + e, top mantissa bit m) and m/2 for e == 0 (0.5 = exponent
++    126); times an E4M3 scale (4 significant bits) the product fits BF16 exactly, so
++    multiplying in BF16 gives the same bits as the old fp32 path."""
+     code = nib & 7
+     e = code >> 1
+-    m = (code & 1).to(tl.float32)
+-    mag = tl.where(e == 0, m * 0.5, tl.exp2((e - 1).to(tl.float32)) * (1.0 + 0.5 * m))
+-    return tl.where((nib & 8) != 0, -mag, mag)
++    m = code & 1
++    exp = tl.where(e == 0, m * 126, e + 126)
++    mant = tl.where(e == 0, 0, m << 6)
++    bits = ((nib & 8) << 12) | (exp << 7) | mant
++    return bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
+ 
+ 
+ @triton.jit
+@@ -354,10 +362,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+                 mask=valid[None, :],
+                 other=0,
+             )
+-            keys = (
+-                _decode_e2m1(key_nibbles)
+-                * _decode_e4m3_to_bf16(key_scales).to(tl.float32)
+-            ).to(tl.bfloat16)
++            keys = _decode_e2m1_bf16(key_nibbles) * _decode_e4m3_to_bf16(key_scales)
+         else:
+             keys = tl.load(
+                 k_cache_ptr
+@@ -414,10 +419,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+                 mask=valid[:, None],
+                 other=0,
+             )
+-            values = (
+-                _decode_e2m1(value_nibbles)
+-                * _decode_e4m3_to_bf16(value_scales).to(tl.float32)
+-            ).to(tl.bfloat16)
++            values = _decode_e2m1_bf16(value_nibbles) * _decode_e4m3_to_bf16(value_scales)
+         elif KV_DTYPE == 2:
+             values = tl.load(
+                 v_cache_ptr
+-- 
+2.53.0
+

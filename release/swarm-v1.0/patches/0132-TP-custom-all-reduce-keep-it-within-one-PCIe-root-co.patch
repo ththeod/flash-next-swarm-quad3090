@@ -1,0 +1,246 @@
+From 7959bdf45652d7d53fec1acdafa4be6fbf84c6f4 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 19:23:24 +0300
+Subject: [PATCH 132/138] TP custom all-reduce: keep it within one PCIe root
+ complex and below a size
+
+VLLM_E2_CUSTOM_AR_SAME_ROOT=1 disables the custom all-reduce for a group
+whose GPUs sit on different PCIe root complexes (NVML bus id -> sysfs
+pciDDDD:BB); VLLM_E2_CUSTOM_AR_MAX_BYTES sends larger messages to NCCL.
+W40 on this box (4x RTX 3090, P2P, every pair 26.2 GB/s by copy engine):
+the one-stage kernel reads its peer's buffer and takes 896-908 us for a
+4.8 MB prefill all-reduce across root complexes vs 233 us with NCCL
+(240 us within GPU0+1's root complex), 28 vs 17 us at 80 KB; within one
+root complex it wins only below ~128 KB (18 vs 21 us at 80 KB, 71 vs 29
+us at 245 KB).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../test_custom_all_reduce_e2_limits.py       | 41 +++++++++++++++++
+ tests/test_envs.py                            |  5 +++
+ .../device_communicators/custom_all_reduce.py | 45 +++++++++++++++++++
+ vllm/envs.py                                  | 32 +++++++++++++
+ 4 files changed, 123 insertions(+)
+ create mode 100644 tests/distributed/test_custom_all_reduce_e2_limits.py
+
+diff --git a/tests/distributed/test_custom_all_reduce_e2_limits.py b/tests/distributed/test_custom_all_reduce_e2_limits.py
+new file mode 100644
+index 0000000..fd2daf8
+--- /dev/null
++++ b/tests/distributed/test_custom_all_reduce_e2_limits.py
+@@ -0,0 +1,41 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Local (2026-10-22) limits on the TP custom all-reduce: VLLM_E2_CUSTOM_AR_MAX_BYTES
++sends larger messages to NCCL, VLLM_E2_CUSTOM_AR_SAME_ROOT keeps it off for GPUs on
++different PCIe root complexes."""
++
++import torch
++
++from vllm.distributed.device_communicators import custom_all_reduce as car
++
++
++def _communicator(max_bytes: int) -> car.CustomAllreduce:
++    communicator = car.CustomAllreduce.__new__(car.CustomAllreduce)
++    communicator.disabled = False
++    communicator.world_size = 2
++    communicator.fully_connected = False
++    communicator.max_size = 8192 * 1024
++    communicator._ptr = 0
++    communicator._e2_max_bytes = max_bytes
++    return communicator
++
++
++def test_max_bytes_sends_larger_messages_to_nccl():
++    small = torch.empty(16, 2560, dtype=torch.bfloat16)  # 80 KB
++    large = torch.empty(48, 2560, dtype=torch.bfloat16)  # 240 KB
++    assert _communicator(0).should_custom_ar(large)
++    limited = _communicator(131072)
++    assert limited.should_custom_ar(small)
++    assert not limited.should_custom_ar(large)
++
++
++def test_spans_pcie_root_complexes(monkeypatch):
++    roots = {0: "pci0000:00", 1: "pci0000:00", 2: "pci0000:20", 3: "pci0000:40"}
++    monkeypatch.setattr(car, "_pcie_root", roots.get)
++    assert not car._spans_pcie_root_complexes([0, 1])
++    assert car._spans_pcie_root_complexes([2, 3])
++    assert car._spans_pcie_root_complexes([1, 2])
++
++
++def test_unknown_topology_keeps_custom_all_reduce(monkeypatch):
++    monkeypatch.setattr(car, "_pcie_root", lambda i: None if i == 3 else "pci0000:00")
++    assert not car._spans_pcie_root_complexes([2, 3])
+diff --git a/tests/test_envs.py b/tests/test_envs.py
+index 258e847..c9ed2c2 100644
+--- a/tests/test_envs.py
++++ b/tests/test_envs.py
+@@ -662,6 +662,9 @@ _FORK_IGNORED = [
+     ("VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S", "45", 45.0),
+     # Balanced PP decode microbatches (local 2026-10-22): scheduler-side, default off.
+     ("VLLM_E2_PP_DECODE_BALANCE", "1", True),
++    # TP custom all-reduce limits (local 2026-10-22): worker-side, default off.
++    ("VLLM_E2_CUSTOM_AR_SAME_ROOT", "1", True),
++    ("VLLM_E2_CUSTOM_AR_MAX_BYTES", "131072", 131072),
+     # Profiling-teardown leak policy: fails the boot unless "0"/"false"/"no".
+     ("VLLM_FAIL_ON_PROFILING_KV_LEAK", "no", False),
+     # Medium-path counter reader: a host-side log cadence, and the older slot-count
+@@ -1080,6 +1083,8 @@ _MUST_BE_READ = {
+     "VLLM_E2_MAMBA_RETAIN_CHECKPOINT": "vllm/v1/core/single_type_kv_cache_manager.py",
+     "VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S": "vllm/v1/core/sched/scheduler.py",
+     "VLLM_E2_PP_DECODE_BALANCE": "vllm/v1/core/sched/scheduler.py",
++    "VLLM_E2_CUSTOM_AR_SAME_ROOT": "vllm/distributed/device_communicators/custom_all_reduce.py",
++    "VLLM_E2_CUSTOM_AR_MAX_BYTES": "vllm/distributed/device_communicators/custom_all_reduce.py",
+     "VLLM_E2_SIDE_CACHE_LAYOUT": "vllm/v1/core/kv_cache_utils.py",
+     "VLLM_E2_SIDE_CACHE_OFFLOAD": "vllm/v1/core/kv_cache_utils.py",
+     "VLLM_FAIL_ON_PROFILING_KV_LEAK": "vllm/v1/worker/gpu/cudagraph_utils.py",
+diff --git a/vllm/distributed/device_communicators/custom_all_reduce.py b/vllm/distributed/device_communicators/custom_all_reduce.py
+index 6c15a98..070ea85 100644
+--- a/vllm/distributed/device_communicators/custom_all_reduce.py
++++ b/vllm/distributed/device_communicators/custom_all_reduce.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
+ from contextlib import contextmanager
+ from typing import cast
+ 
+@@ -33,6 +34,31 @@ except ImportError:
+ logger = init_logger(__name__)
+ 
+ 
++def _pcie_root(physical_device_id: int) -> str | None:
++    """The PCIe root complex (sysfs ``pciDDDD:BB``) a GPU hangs off, or None."""
++    try:
++        from vllm.platforms.cuda import pynvml
++
++        pynvml.nvmlInit()
++        try:
++            handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
++            bus_id = pynvml.nvmlDeviceGetPciInfo(handle).busId
++        finally:
++            pynvml.nvmlShutdown()
++        if isinstance(bus_id, bytes):
++            bus_id = bus_id.decode()
++        domain, rest = bus_id.lower().split(":", 1)
++        path = os.path.realpath(f"/sys/bus/pci/devices/{int(domain, 16):04x}:{rest}")
++        return next((c for c in path.split("/") if c.startswith("pci")), None)
++    except Exception:  # unknown topology: leave custom all-reduce as configured
++        return None
++
++
++def _spans_pcie_root_complexes(physical_device_ids: list[int]) -> bool:
++    roots = [_pcie_root(i) for i in physical_device_ids]
++    return None not in roots and len(set(roots)) > 1
++
++
+ def _has_local_multicast_support(device: torch.device) -> bool:
+     """Return whether this CUDA device can allocate multicast memory."""
+     if torch_symm_mem is None or not current_platform.is_cuda():
+@@ -142,6 +168,8 @@ class CustomAllreduce:
+         self._IS_CAPTURING = False
+         self._ptr = 0
+         self.disabled = True
++        # Messages above this many bytes go to NCCL (0 = only max_size applies).
++        self._e2_max_bytes = envs.VLLM_E2_CUSTOM_AR_MAX_BYTES
+         self.mnnvl_buffer = None
+         self.mnnvl_handle = None
+         self.mnnvl_peer_buffers: list[torch.Tensor] | None = None
+@@ -233,6 +261,21 @@ class CustomAllreduce:
+             physical_device_ids = [t.item() for t in gather_list]
+             assert current_platform.is_cuda_alike()
+             fully_connected = current_platform.is_fully_connected(physical_device_ids)
++        if (
++            same_node
++            and not fully_connected
++            and envs.VLLM_E2_CUSTOM_AR_SAME_ROOT
++            and _spans_pcie_root_complexes(physical_device_ids)
++        ):
++            # The one-stage kernel reads the peer's buffer; across PCIe root
++            # complexes those reads run ~4x slower than NCCL (W40), within one
++            # they are on par.
++            logger.info(
++                "Custom allreduce is disabled for GPUs %s: they sit on different "
++                "PCIe root complexes (VLLM_E2_CUSTOM_AR_SAME_ROOT=1); NCCL is used.",
++                physical_device_ids,
++            )
++            return
+         if same_node and world_size > 2 and not fully_connected:
+             logger.warning(
+                 "Custom allreduce is disabled because it's not supported on"
+@@ -415,6 +458,8 @@ class CustomAllreduce:
+             return False
+         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
+         # little performance improvement over NCCL.
++        if self._e2_max_bytes and inp_size > self._e2_max_bytes:
++            return False
+         if self.world_size == 2 or self.fully_connected:
+             return inp_size < self.max_size
+         return False
+diff --git a/vllm/envs.py b/vllm/envs.py
+index ca517e0..200ded9 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -471,6 +471,15 @@ if TYPE_CHECKING:
+     # through both stages is paced by the biggest microbatch). Scheduler-side
+     # only. AOT: no. CAPTURE: no.
+     VLLM_E2_PP_DECODE_BALANCE: bool = False
++    # (local 2026-10-22) TP custom all-reduce on PCIe: the one-stage kernel reads
++    # its peer's buffer, which runs ~4x slower than NCCL between GPUs on
++    # different PCIe root complexes (W40: 900 vs 233 us at 4.8 MB, 28 vs 17 us
++    # at 80 KB) and is on par within one. SAME_ROOT=1 disables custom
++    # all-reduce for a group that spans root complexes (NCCL takes over);
++    # MAX_BYTES > 0 sends larger messages to NCCL (W40 GPU0+1: 245 KB custom
++    # 71 us vs NCCL 29 us). Worker-side, read once per communicator.
++    VLLM_E2_CUSTOM_AR_SAME_ROOT: bool = False
++    VLLM_E2_CUSTOM_AR_MAX_BYTES: int = 0
+     # v2.5 side-cache layout (Flash-Next PLE + QSA ring): stop charging each
+     # tiny side cache a whole packed pool block per request. The TP-replicated
+     # PLE short-conv state group is folded into a GDN group that has a spare
+@@ -978,6 +987,20 @@ def _e2_nonneg_seconds(name: str) -> float:
+     return value
+ 
+ 
++def _e2_nonneg_int(name: str) -> int:
++    """A non-negative integer; unset or "0" means off."""
++    raw = os.environ.get(name)
++    if raw is None:
++        return 0
++    try:
++        value = int(raw)
++    except ValueError:
++        raise ValueError(f"{name} must be a non-negative integer, got {raw!r}") from None
++    if value < 0:
++        raise ValueError(f"{name} must be a non-negative integer, got {raw!r}")
++    return value
++
++
+ def _e2_strict_switch(name: str, default: bool = False) -> bool:
+     """Parse a fork on/off switch that accepts exactly ``"0"`` and ``"1"``.
+ 
+@@ -2683,6 +2706,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_E2_PP_DECODE_BALANCE": lambda: _e2_strict_switch(
+         "VLLM_E2_PP_DECODE_BALANCE", default=False
+     ),
++    # Custom all-reduce only within one PCIe root complex / below a size (local; default off).
++    "VLLM_E2_CUSTOM_AR_SAME_ROOT": lambda: _e2_strict_switch(
++        "VLLM_E2_CUSTOM_AR_SAME_ROOT", default=False
++    ),
++    "VLLM_E2_CUSTOM_AR_MAX_BYTES": lambda: _e2_nonneg_int("VLLM_E2_CUSTOM_AR_MAX_BYTES"),
+     # Side-cache layout (v2.5; PLE state folded into a GDN group + QSA ring slot
+     # packing), default ON. Strict "0"/"1"; read once per get_kv_cache_configs call.
+     "VLLM_E2_SIDE_CACHE_LAYOUT": lambda: _e2_strict_switch(
+@@ -2969,6 +2997,10 @@ def compile_factors() -> dict[str, object]:
+         "VLLM_E2_MAMBA_RETAIN_CHECKPOINT",
+         "VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S",
+         "VLLM_E2_PP_DECODE_BALANCE",
++        # Which TP all-reduce backend runs (custom vs NCCL) is decided at runtime
++        # per call and captured per boot; nothing compiled depends on it.
++        "VLLM_E2_CUSTOM_AR_SAME_ROOT",
++        "VLLM_E2_CUSTOM_AR_MAX_BYTES",
+         # Boot-failure policy of a host-side profiling-teardown check; read by no
+         # compiled code.
+         "VLLM_FAIL_ON_PROFILING_KV_LEAK",
+-- 
+2.53.0
+

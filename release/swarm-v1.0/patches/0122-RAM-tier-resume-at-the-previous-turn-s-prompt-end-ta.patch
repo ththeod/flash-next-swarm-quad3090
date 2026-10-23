@@ -1,0 +1,247 @@
+From a05e409c06d2b56dcd2a2bfcd4a1d9269f4a74b7 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 12:43:35 +0300
+Subject: [PATCH 122/138] RAM tier: resume at the previous turn's prompt-end
+ tail; tail-chunk store index; fill and row-kind metrics
+
+The partial-tail scan started at the complete hit, which stops at the newest
+Mamba-aligned state (one to two blocks before the prompt end), so the previous
+turn's tail checkpoint was unreachable and RAM resumes fell back to an older
+aligned state (agent turns recomputed ~15K tokens). Anchor the scan at the end
+of the attention prefix present in the offload store (newest block first, plus
+the block before and the original block). After a partial-tail load, the tail's
+chunk is now stored once it fills (it was skipped). New metrics:
+kv_offload_cpu_cache_filled_chunks / total_chunks, stored_rows_{chunk,boundary,tail}.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../kv_connector/v1/offloading/metrics.py     | 13 +++
+ .../kv_connector/v1/offloading/scheduler.py   | 81 +++++++++++++++++--
+ vllm/v1/kv_offload/cpu/common.py              |  3 +
+ vllm/v1/kv_offload/cpu/manager.py             |  5 ++
+ vllm/v1/kv_offload/cpu/spec.py                | 10 +++
+ 5 files changed, 104 insertions(+), 8 deletions(-)
+
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py
+index 58023c3..dd34c5f 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py
+@@ -36,6 +36,10 @@ class _ConnectorMetricName:
+     LOOKUP_SYNC_DELAY = "vllm:kv_offload_lookup_sync_delay_seconds"
+     LOOKUP_ASYNC_DELAY = "vllm:kv_offload_lookup_async_delay_seconds"
+     ALLOCATION_FAILURE = "vllm:kv_offload_allocation_failure"
++    # local: RAM-tier rows allocated per store kind (one row per offload key)
++    STORED_ROWS_CHUNK = "vllm:kv_offload_stored_rows_chunk"
++    STORED_ROWS_BOUNDARY = "vllm:kv_offload_stored_rows_boundary"
++    STORED_ROWS_TAIL = "vllm:kv_offload_stored_rows_tail"
+ 
+ 
+ class _TransferType:
+@@ -126,6 +130,15 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
+                 "Number of KV offload store allocation attempts that failed."
+             ),
+         ),
++        _ConnectorMetricName.STORED_ROWS_CHUNK: OffloadingCounterMetadata(
++            documentation="Offload rows stored for complete prompt chunks.",
++        ),
++        _ConnectorMetricName.STORED_ROWS_BOUNDARY: OffloadingCounterMetadata(
++            documentation="Offload rows stored for aligned recurrent-state boundaries.",
++        ),
++        _ConnectorMetricName.STORED_ROWS_TAIL: OffloadingCounterMetadata(
++            documentation="Offload rows stored for partial-tail checkpoints.",
++        ),
+     }
+ 
+ 
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 0b53c9f..5686902 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import os
+ import time
+-from collections.abc import Iterable, Sequence
++from collections.abc import Iterable, Iterator, Sequence
+ from dataclasses import dataclass, field
+ from itertools import chain, islice
+ from typing import Any, NamedTuple
+@@ -1002,16 +1002,15 @@ class OffloadingConnectorScheduler:
+         local_tokens = req_status.num_locally_computed_tokens
+         complete_boundary = local_tokens + complete_hit
+         tokens_per_hash = self.config.tokens_per_hash
+-        block_end = complete_boundary + self._partial_tail_block_size
+-        max_boundary = min(req_status.req.num_prompt_tokens - 1, block_end - 1)
++        cap = req_status.req.num_prompt_tokens - 1
+         if max_num_new_tokens is not None:
+-            max_boundary = min(max_boundary, local_tokens + max_num_new_tokens)
+-        max_boundary = round_down(max_boundary, tokens_per_hash)
+-        if max_boundary <= complete_boundary:
++            cap = min(cap, local_tokens + max_num_new_tokens)
++        cap = round_down(cap, tokens_per_hash)
++        if cap <= complete_boundary:
+             return complete_hit
+ 
+         pending = False
+-        for boundary in range(max_boundary, complete_boundary, -tokens_per_hash):
++        for boundary in self._tail_candidates(req_status, complete_boundary, cap):
+             boundary_pending = False
+             boundary_missed = False
+             boundary_keys = []
+@@ -1042,6 +1041,53 @@ class OffloadingConnectorScheduler:
+             return None
+         return complete_hit
+ 
++    def _attention_prefix_end(
++        self, req_status: RequestOffloadState, complete_boundary: int, cap: int
++    ) -> int:
++        """End of the prefix whose chunk-level groups (attention) are all in the
++        offload store, walking forward from the complete hit. Recurrent groups are
++        skipped: a partial-tail hit loads only their state at the tail boundary.
++        (local 2026-10-22: the complete hit stops at the newest Mamba-aligned key,
++        one to two blocks before the previous turn's tail, which made that tail
++        unreachable and sent RAM resumes back to an older aligned state.)"""
++        block = self._partial_tail_block_size
++        end = round_down(cap, block)
++        for group_config, group_state in zip(
++            self.config.kv_group_configs, req_status.group_states
++        ):
++            if group_config.sliding_window_size_in_chunks is not None:
++                continue
++            tokens_per_chunk = group_config.tokens_per_chunk
++            keys = group_state.offload_keys
++            idx = complete_boundary // tokens_per_chunk
++            while (
++                (idx + 1) * tokens_per_chunk <= end
++                and idx < len(keys)
++                and self.manager.lookup(keys[idx], req_status.req_context)
++                is LookupResult.HIT
++            ):
++                idx += 1
++            end = min(end, idx * tokens_per_chunk)
++        return max(complete_boundary, end)
++
++    def _tail_candidates(
++        self, req_status: RequestOffloadState, complete_boundary: int, cap: int
++    ) -> Iterator[int]:
++        """Partial-tail boundaries to try, newest first: the block where the stored
++        attention prefix ends and the block before it, then (as before the local
++        change) the block right after the complete hit."""
++        block = self._partial_tail_block_size
++        step = self.config.tokens_per_hash
++        anchor = self._attention_prefix_end(req_status, complete_boundary, cap)
++        starts = [anchor]
++        if anchor - block >= complete_boundary:
++            starts.append(anchor - block)
++        if complete_boundary not in starts:
++            starts.append(complete_boundary)
++        for start in starts:
++            top = round_down(min(cap, start + block - 1), step)
++            yield from range(top, start, -step)
++
+     def on_new_request(self, request: Request) -> None:
+         """Called when a new request is added to the scheduler."""
+         req_context = _create_req_context(request)
+@@ -1200,7 +1246,16 @@ class OffloadingConnectorScheduler:
+             # request-level, next_stored_chunk_idx stays at 0 so all
+             # chunks (including hits) are offloaded.
+             if req_status.offloading_context.policy == OffloadPolicy.CHUNK_LEVEL:
+-                group_state.next_stored_chunk_idx = num_chunks
++                # local: after a partial-tail load the tail's chunk is only partly in
++                # the offload store; let the regular path store it once it is full.
++                # (chunk-level groups only: recurrent groups never store chunks, and
++                # their sliding-window bookkeeping keys off this index)
++                group_state.next_stored_chunk_idx = (
++                    num_cached_tokens // tokens_per_chunk
++                    if partial_tail_boundary is not None
++                    and group_config.sliding_window_size_in_chunks is None
++                    else num_chunks
++                )
+ 
+         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
+         dst_spec = GPULoadStoreSpec(
+@@ -1318,6 +1373,10 @@ class OffloadingConnectorScheduler:
+                     continue
+                 if not store_output.keys_to_store:
+                     continue
++                self._connector_stats.increase_counter(
++                    _ConnectorMetricName.STORED_ROWS_BOUNDARY,
++                    len(store_output.keys_to_store),
++                )
+ 
+                 job_id = self._generate_job_id()
+                 req_status.transfer_jobs.add(job_id)
+@@ -1423,6 +1482,9 @@ class OffloadingConnectorScheduler:
+                 continue
+             if not store_output.keys_to_store:
+                 continue
++            self._connector_stats.increase_counter(
++                _ConnectorMetricName.STORED_ROWS_TAIL, len(store_output.keys_to_store)
++            )
+ 
+             for group_config, key in zip(self.config.kv_group_configs, keys):
+                 if key in store_output.keys_to_store:
+@@ -1677,6 +1739,9 @@ class OffloadingConnectorScheduler:
+             if not store_output.keys_to_store:
+                 req_status.advance_stored_idx(num_offloadable_tokens)
+                 continue
++            self._connector_stats.increase_counter(
++                _ConnectorMetricName.STORED_ROWS_CHUNK, len(store_output.keys_to_store)
++            )
+ 
+             self._touch(req_status)
+ 
+diff --git a/vllm/v1/kv_offload/cpu/common.py b/vllm/v1/kv_offload/cpu/common.py
+index 61dce93..753ceee 100644
+--- a/vllm/v1/kv_offload/cpu/common.py
++++ b/vllm/v1/kv_offload/cpu/common.py
+@@ -11,6 +11,9 @@ class CPUOffloadingMetrics:
+     CPU_ALLOCATION_SIZE = "vllm:kv_offload_cpu_allocation_size"
+     CPU_CACHE_WRITE_USAGE_PERC = "vllm:kv_offload_cpu_cache_write_usage_perc"
+     CPU_CACHE_READ_USAGE_PERC = "vllm:kv_offload_cpu_cache_read_usage_perc"
++    # local: how full the tier is (stored + in-flight chunks, idle cached chunks included) and its size
++    CPU_CACHE_FILLED_CHUNKS = "vllm:kv_offload_cpu_cache_filled_chunks"
++    CPU_CACHE_TOTAL_CHUNKS = "vllm:kv_offload_cpu_cache_total_chunks"
+ 
+ 
+ class CPULoadStoreSpec(BlockIDsLoadStoreSpec):
+diff --git a/vllm/v1/kv_offload/cpu/manager.py b/vllm/v1/kv_offload/cpu/manager.py
+index 67b469b..535c149 100644
+--- a/vllm/v1/kv_offload/cpu/manager.py
++++ b/vllm/v1/kv_offload/cpu/manager.py
+@@ -315,6 +315,11 @@ class CPUOffloadingManager(OffloadingManager):
+         )
+         usage = num_used / self._num_chunks if self._num_chunks > 0 else 0.0
+         stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC, usage)
++        stats.set_gauge(
++            CPUOffloadingMetrics.CPU_CACHE_FILLED_CHUNKS,
++            self._num_allocated_chunks - len(self._free_list),
++        )
++        stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_TOTAL_CHUNKS, self._num_chunks)
+ 
+         for allocation_size in self.allocation_sizes_in_current_batch:
+             stats.observe_histogram(
+diff --git a/vllm/v1/kv_offload/cpu/spec.py b/vllm/v1/kv_offload/cpu/spec.py
+index 00b36e8..1a13fbe 100644
+--- a/vllm/v1/kv_offload/cpu/spec.py
++++ b/vllm/v1/kv_offload/cpu/spec.py
+@@ -71,6 +71,16 @@ class CPUOffloadingSpec(OffloadingSpec):
+                     "completed (0.0 = idle, 1.0 = saturated)."
+                 ),
+             ),
++            CPUOffloadingMetrics.CPU_CACHE_FILLED_CHUNKS: OffloadingGaugeMetadata(
++                documentation=(
++                    "Number of CPU KV-cache chunks holding data (cached or being "
++                    "transferred). Divide by kv_offload_cpu_cache_total_chunks for "
++                    "how full the tier is."
++                ),
++            ),
++            CPUOffloadingMetrics.CPU_CACHE_TOTAL_CHUNKS: OffloadingGaugeMetadata(
++                documentation="Number of chunks the CPU KV-cache tier holds.",
++            ),
+             CPUOffloadingMetrics.CPU_ALLOCATION_SIZE: OffloadingHistogramMetadata(
+                 documentation=(
+                     "Histogram of the number of CPU chunks requested by each "
+-- 
+2.53.0
+

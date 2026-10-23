@@ -1,0 +1,638 @@
+From 26b7c9654df3aa1a1bc0e9dcb0950cb7952356cc Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 17:00:34 +0300
+Subject: [PATCH 099/138] RAM KV tier with RecoverSSM: native CPU offloading
+ for the hybrid model
+
+- Allow the native CPU OffloadingConnector together with RecoverSSM
+  (VLLM_E2_RECOVERSSM_OFFLOAD=1); P/D and every other connector stay rejected.
+  VLLM_E2_BOUNDARY_OFFLOAD_HOLD_STEPS / VLLM_E2_MAMBA_HIT_DEFER_STEPS tune when
+  boundary states are stored and when a Mamba hit is deferred.
+- Uniform worker KV stride for the shared offload region under pipeline
+  parallelism (VLLM_OFFLOAD_WORKER_KV_BYTES_PER_BLOCK): the region interleaves
+  one slot per worker inside each chunk, and PP ranks holding different layers
+  derived different strides, so slots overlapped and reloads were corrupted.
+- Register the whole mmap as pinned memory with cudaHostRegister, resetting
+  CUDA's sticky error and retrying when registration fails.
+- Scratch filtering keeps the scheduler/worker allocation stride.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/config/vllm.py                           |  47 ++++++
+ .../kv_connector/v1/offloading/config.py      |  32 ++++-
+ .../kv_connector/v1/offloading/scheduler.py   |  41 ++++++
+ .../kv_connector/v1/offloading/worker.py      |   5 +-
+ vllm/v1/core/kv_cache_manager.py              |  16 +++
+ vllm/v1/core/single_type_kv_cache_manager.py  | 134 ++++++++++++++++--
+ vllm/v1/kv_offload/cpu/gpu_worker.py          |  54 ++++++-
+ .../kv_offload/cpu/shared_offload_region.py   |   2 +-
+ vllm/v1/worker/gpu/kv_connector.py            |  25 +++-
+ vllm/v1/worker/gpu/model_runner.py            |   5 +
+ 10 files changed, 339 insertions(+), 22 deletions(-)
+
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 2538e80..cf9ebe7 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -3322,6 +3322,7 @@ class VllmConfig:
+         if (
+             self.kv_transfer_config is not None
+             and self.kv_transfer_config.is_kv_transfer_instance
++            and not self._recoverssm_cpu_offload_allowed()
+         ):
+             raise ValueError(
+                 "--use-replayssm is incompatible with KV connectors "
+@@ -3329,6 +3330,52 @@ class VllmConfig:
+             )
+         return self
+ 
++    def _recoverssm_cpu_offload_allowed(self) -> bool:
++        """Local (Stage 2): RecoverSSM with the native CPU OffloadingConnector.
++
++        Opt-in (VLLM_E2_RECOVERSSM_OFFLOAD=1) and only in the shape that was
++        analysed: prompt-only stores (every stored GDN/PLE boundary is written by
++        prefill, never by a verify row whose commit a non-last PP rank defers),
++        no sparse prefix retention, RecoverSSM proper (Model Runner V2), and on
++        PP the boundary hold and the hit-deferral window set to at least
++        pp_size steps. P/D and every other connector stay rejected."""
++        if os.environ.get("VLLM_E2_RECOVERSSM_OFFLOAD", "0") != "1":
++            return False
++        kvt = self.kv_transfer_config
++        if kvt is None or kvt.kv_connector != "OffloadingConnector":
++            return False
++        extra = kvt.kv_connector_extra_config or {}
++        if not bool(extra.get("offload_prompt_only", True)):
++            raise ValueError(
++                "VLLM_E2_RECOVERSSM_OFFLOAD=1 requires offload_prompt_only=True"
++            )
++        if self.cache_config.prefix_cache_retention_interval not in (0, None):
++            raise ValueError(
++                "VLLM_E2_RECOVERSSM_OFFLOAD=1 requires "
++                "prefix_cache_retention_interval=0"
++            )
++        if not self.use_v2_model_runner:
++            raise ValueError(
++                "VLLM_E2_RECOVERSSM_OFFLOAD=1 requires VLLM_USE_V2_MODEL_RUNNER=1"
++            )
++        pp = self.parallel_config.pipeline_parallel_size
++        if pp > 1:
++            hold = int(os.environ.get("VLLM_E2_BOUNDARY_OFFLOAD_HOLD_STEPS", "0"))
++            defer = int(os.environ.get("VLLM_E2_MAMBA_HIT_DEFER_STEPS", "1"))
++            if hold < pp or defer < pp:
++                raise ValueError(
++                    "VLLM_E2_RECOVERSSM_OFFLOAD=1 with pipeline_parallel_size="
++                    f"{pp} requires VLLM_E2_BOUNDARY_OFFLOAD_HOLD_STEPS and "
++                    f"VLLM_E2_MAMBA_HIT_DEFER_STEPS >= {pp} (got {hold}, {defer})"
++                )
++        logger.warning(
++            "RecoverSSM with the CPU OffloadingConnector (local Stage 2, "
++            "prompt-only stores, boundary hold %s, hit deferral %s steps)",
++            os.environ.get("VLLM_E2_BOUNDARY_OFFLOAD_HOLD_STEPS", "0"),
++            os.environ.get("VLLM_E2_MAMBA_HIT_DEFER_STEPS", "1"),
++        )
++        return True
++
+ 
+ _current_vllm_config: VllmConfig | None = None
+ _current_prefix: str | None = None
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
+index c4e6d0f..9f60c04 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
+@@ -4,6 +4,8 @@
+ 
+ from typing import TYPE_CHECKING
+ 
++from vllm.logger import init_logger
++
+ from vllm.utils.math_utils import round_up
+ from vllm.v1.core.kv_cache_utils import (
+     resolve_dcp_kv_block_size,
+@@ -28,6 +30,8 @@ from vllm.v1.kv_offload.config import (
+     OffloadingParallelConfig,
+ )
+ 
++logger = init_logger(__name__)
++
+ if TYPE_CHECKING:
+     from vllm.config import VllmConfig
+     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+@@ -35,7 +39,7 @@ if TYPE_CHECKING:
+ 
+ def get_offloading_group_ids(kv_cache_config: "KVCacheConfig") -> tuple[int, ...]:
+     if kv_cache_config.hisparse_host_num_blocks is None:
+-        return tuple(range(len(kv_cache_config.kv_cache_groups)))
++        return kv_cache_config.prefix_cacheable_group_ids
+     return tuple(
+         group_id
+         for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+@@ -135,12 +139,12 @@ def build_offloading_config(
+             )
+ 
+     worker_kv_bytes_per_block = 0
+-    all_groups_selected = len(selected_groups) == len(kv_cache_config.kv_cache_groups)
+     if (
+-        all_groups_selected
++        kv_cache_config.hisparse_host_num_blocks is None
+         and kv_cache_config.num_blocks > 0
+         and kv_cache_config.kv_cache_tensors
+     ):
++        # Scratch filtering must preserve the scheduler/worker allocation stride.
+         # Every KVCacheTensor describes placement within the same backing allocation,
+         # so its size is the total, not a per-tensor share.
+         total_gpu_kv_bytes = kv_cache_config.kv_cache_tensors[0].size
+@@ -149,6 +153,28 @@ def build_offloading_config(
+         worker_kv_bytes_per_block = sum(
+             _group_kv_bytes_per_block(group) for _, group in selected_groups
+         )
++    # Local fix (PP + shared offload region): the shared mmap region interleaves one
++    # slot per worker inside each chunk, so every worker (and the scheduler) must use
++    # the SAME bytes-per-block stride. Under pipeline parallelism ranks hold different
++    # layers and can derive different strides -> overlapping slots -> corrupted
++    # reloads. Log the locally derived value and allow a uniform override.
++    import os as _os
++    import torch as _torch
++    _dev = _torch.cuda.current_device() if _torch.cuda.is_available() and _torch.cuda.is_initialized() else -1
++    logger.warning(
++        "offload-stride: device=%s pid=%s derived worker_kv_bytes_per_block=%d "
++        "(num_blocks=%d, tensors=%d)", _dev, _os.getpid(), worker_kv_bytes_per_block,
++        kv_cache_config.num_blocks, len(kv_cache_config.kv_cache_tensors))
++    _ov = _os.environ.get("VLLM_OFFLOAD_WORKER_KV_BYTES_PER_BLOCK")
++    if _ov:
++        _ov_i = int(_ov)
++        if _ov_i < worker_kv_bytes_per_block:
++            raise ValueError(
++                f"VLLM_OFFLOAD_WORKER_KV_BYTES_PER_BLOCK={_ov_i} is smaller than this "
++                f"rank's derived {worker_kv_bytes_per_block}")
++        logger.warning("offload-stride: using uniform override %d (derived %d)", _ov_i, worker_kv_bytes_per_block)
++        worker_kv_bytes_per_block = _ov_i
++
+ 
+     single_group_spec = (
+         kv_cache_config.kv_cache_groups[0].kv_cache_spec
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 2fb3c5b..0b53c9f 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ import time
+ from collections.abc import Iterable, Sequence
+ from dataclasses import dataclass, field
+@@ -566,6 +567,26 @@ class OffloadingConnectorScheduler:
+         self._mamba_align_size: int | None = resolve_mamba_align_size(
+             spec, kv_cache_config
+         )
++        # Local fix (offload + MTP corruption on Qwen3.8-Flash-Next / halt95 v2.2): with
++        # speculative decoding whose drafter shares the target's KV groups (no group is
++        # annotated is_eagle_group), the GPU prefix-cache path drops the last matched
++        # block (drop_eagle_block) but the offload lookup did not, so a RAM hit could
++        # resume from the volatile last block's Mamba/GDN state and produce garbage.
++        # Mirror the GPU behaviour: cap offload hits one aligned block earlier.
++        spec_cfg = vllm_config.speculative_config
++        self._eagle_drop_unannotated: bool = bool(
++            os.environ.get("VLLM_OFFLOAD_EAGLE_DROP", "0") == "1"
++            and spec_cfg is not None
++            and spec_cfg.use_eagle_block_drop()
++            and not any(c.is_eagle_group for c in self.config.kv_group_configs)
++        )
++        self._eagle_drop_align: int = (
++            self._mamba_align_size or self.config.tokens_per_hash
++        )
++        if self._eagle_drop_unannotated:
++            logger.info(
++                "KV offloading: applying eagle/MTP last-block drop to offload hits "
++                "(align=%d tokens)", self._eagle_drop_align)
+         self._partial_tail_block_size = (
+             self.config.kv_group_configs[0].tokens_per_block
+             if self.config.supports_partial_tail
+@@ -952,6 +973,26 @@ class OffloadingConnectorScheduler:
+         self,
+         req_status: RequestOffloadState,
+         max_num_new_tokens: int | None = None,
++    ) -> int | None:
++        hit = self._lookup_unadjusted(req_status, max_num_new_tokens)
++        if not hit or not self._eagle_drop_unannotated:
++            return hit
++        # Re-run the lookup capped one aligned block earlier, so every group's
++        # availability (e.g. sparse Mamba checkpoints) is verified at the new end.
++        local = req_status.num_locally_computed_tokens
++        align = self._eagle_drop_align
++        end = round_down(local + hit, align) - align
++        min_chunk = min(c.tokens_per_chunk for c in self.config.kv_group_configs)
++        if end - local < min_chunk:
++            return 0
++        new_hit = self._lookup_unadjusted(req_status, end - local)
++        logger.debug("eagle-drop: offload hit %s -> %s tokens (local %d)", hit, new_hit, local)
++        return new_hit
++
++    def _lookup_unadjusted(
++        self,
++        req_status: RequestOffloadState,
++        max_num_new_tokens: int | None = None,
+     ) -> int | None:
+         complete_hit = self._lookup_complete_chunks(req_status, max_num_new_tokens)
+         req_status.partial_tail_boundary = None
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+index 14e826e..9a8ea90 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+@@ -139,8 +139,9 @@ class OffloadingConnectorWorker:
+             ),
+             None,
+         )
+-        if packed_layer_name is not None and len(selected_groups) == len(
+-            kv_cache_config.kv_cache_groups
++        if (
++            packed_layer_name is not None
++            and kv_cache_config.hisparse_host_num_blocks is None
+         ):
+             (tensor,) = tensors_per_block[packed_layer_name]
+             num_blocks = tensor.shape[0]
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index c0bc6c2..9566daa 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -672,6 +672,22 @@ class KVCacheManager:
+             request: The request to free the blocks.
+         """
+         self.release_pinned_hit(request.request_id)
++        # Local (RecoverSSM + PP): an early free (preemption runs while the request
++        # is still RUNNING; aborts and errors) can skip a pending non-last-rank
++        # GDN/PLE commit; drop those blocks' prefix-cache hashes first.
++        if request.status in (
++            RequestStatus.RUNNING,
++            RequestStatus.FINISHED_ABORTED,
++            RequestStatus.FINISHED_ERROR,
++        ):
++            for mgr in self.coordinator.single_type_managers:
++                evict = getattr(mgr, "evict_uncommitted_boundaries", None)
++                if evict is not None and evict(request.request_id):
++                    logger.debug(
++                        "Dropped uncommitted boundary hashes of %s (%s)",
++                        request.request_id,
++                        request.status,
++                    )
+         if not self._grace_eligible(request):
+             self.coordinator.free(request.request_id)
+             return
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 24a72bb..810d11c 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1,8 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ from abc import ABC, abstractmethod
+-from collections import defaultdict
++from collections import defaultdict, deque
+ from collections.abc import Callable, Sequence
+ from typing import TYPE_CHECKING, ClassVar
+ 
+@@ -1642,6 +1643,36 @@ class MambaManager(SingleTypeKVCacheManager):
+         # Mamba checkpoints follow Eagle's global replay boundary.
+         self.drop_eagle_checkpoint_block = False
+         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
++        # Local (RecoverSSM + CPU KV offload, PP): on a non-last pipeline rank a
++        # verify row's GDN/PLE commit lands pp_size steps after the step that
++        # hashed its boundary block. (a) Defer prefix hits on a freshly hashed
++        # block for that many steps, not only the current one
++        # (VLLM_E2_MAMBA_HIT_DEFER_STEPS, default 1 = upstream behaviour). (b)
++        # Hold boundary-state hand-offs produced past the prompt (decode rows)
++        # for VLLM_E2_BOUNDARY_OFFLOAD_HOLD_STEPS scheduler steps, pinned, before a
++        # connector may store them; drop them if the request is freed first
++        # (its deferred commit may never run). Default 0 = upstream behaviour.
++        self._hit_defer_steps = max(
++            1, int(os.environ.get("VLLM_E2_MAMBA_HIT_DEFER_STEPS", "1"))
++        )
++        # Hashes of decode-produced boundary blocks (the only ones a non-last PP
++        # rank commits late), this step and the previous hit_defer_steps - 1.
++        self._decode_hashed_this_step: set[BlockHashWithGroupId] = set()
++        self._recent_decode_hashed_blocks: deque[set[BlockHashWithGroupId]] = deque(
++            maxlen=self._hit_defer_steps - 1 or None
++        )
++        self._boundary_hold_steps = max(
++            0, int(os.environ.get("VLLM_E2_BOUNDARY_OFFLOAD_HOLD_STEPS", "0"))
++        )
++        self._boundary_step = 0
++        self._held_boundary_offloads: list[
++            tuple[int, tuple[str, int, KVCacheBlock, int]]
++        ] = []
++        # Decode-produced boundary blocks hashed in the last hold window, per
++        # request: if the request is freed early (preempted, aborted), its
++        # deferred non-last-rank commit may never run, so these hashes are
++        # dropped from the prefix cache (evict_uncommitted_boundaries).
++        self._recent_decode_hashed: dict[str, list[tuple[int, KVCacheBlock]]] = {}
+         if self.mamba_cache_mode == "align":
+             # Mapping from request ID to the index of the block
+             # allocated in the previous step
+@@ -2085,7 +2116,7 @@ class MambaManager(SingleTypeKVCacheManager):
+         assert isinstance(self.kv_cache_spec, MambaSpec)
+         if (
+             len(new_computed_blocks) > 0
+-            and new_computed_blocks[-1].block_hash in self.cached_blocks_this_step
++            and self._hashed_recently(new_computed_blocks[-1].block_hash)
+         ):
+             # Mamba can't rely on blocks generated by other requests in the current step
+             # To put it in the next step, we return num_gpu_blocks + 1 so
+@@ -2350,6 +2381,19 @@ class MambaManager(SingleTypeKVCacheManager):
+                 for entry in self._pending_boundary_state_offloads
+                 if entry[0] != request_id
+             ]
++            self._recent_decode_hashed.pop(request_id, None)
++            if self._held_boundary_offloads:
++                dropped = [
++                    e for _, e in self._held_boundary_offloads if e[0] == request_id
++                ]
++                if dropped:
++                    self._held_boundary_offloads = [
++                        (r, e)
++                        for r, e in self._held_boundary_offloads
++                        if e[0] != request_id
++                    ]
++                    for entry in dropped:
++                        self._unpin_block(entry[2])
+             # The coordinator pops the retained checkpoint first and frees it
+             # after every group. A direct caller still gets it back, first in
+             # allocation order, so the caller's reversed free releases it last.
+@@ -2412,17 +2456,89 @@ class MambaManager(SingleTypeKVCacheManager):
+                     # Offer every retained boundary with its exact block.
+                     # The connector filters against its save window, which may
+                     # extend past the original prompt during resumed prefill.
+-                    self._pending_boundary_state_offloads.append(
+-                        (
+-                            request.request_id,
+-                            self.kv_cache_group_id,
+-                            block,
+-                            block.block_hash_num_tokens,
+-                        )
++                    entry = (
++                        request.request_id,
++                        self.kv_cache_group_id,
++                        block,
++                        block.block_hash_num_tokens,
+                     )
++                    if (
++                        self._boundary_hold_steps > 0
++                        and block.block_hash_num_tokens > request.num_prompt_tokens
++                    ):
++                        # Past the prompt: possibly written by a verify row whose
++                        # commit is still deferred on a non-last PP rank.
++                        recent = self._recent_decode_hashed.setdefault(
++                            request.request_id, []
++                        )
++                        horizon = self._boundary_step - self._boundary_hold_steps
++                        recent[:] = [(st, b) for st, b in recent if st >= horizon]
++                        recent.append((self._boundary_step, block))
++                        if self._hit_defer_steps > 1:
++                            self._decode_hashed_this_step.add(block.block_hash)
++                        self._pin_block(block)
++                        self._held_boundary_offloads.append(
++                            (self._boundary_step + self._boundary_hold_steps, entry)
++                        )
++                    else:
++                        self._pending_boundary_state_offloads.append(entry)
+ 
+     def new_step_starts(self) -> None:
+         self.cached_blocks_this_step.clear()
++        if self._hit_defer_steps > 1:
++            self._recent_decode_hashed_blocks.append(self._decode_hashed_this_step)
++            self._decode_hashed_this_step = set()
++        self._boundary_step += 1
++
++    def _hashed_recently(self, block_hash: BlockHashWithGroupId | None) -> bool:
++        # Upstream: any block hashed this step. Plus (PP + RecoverSSM) a
++        # decode-produced boundary block hashed in the previous steps of the window.
++        if block_hash is None:
++            return False
++        if block_hash in self.cached_blocks_this_step:
++            return True
++        return any(block_hash in s for s in self._recent_decode_hashed_blocks)
++
++    def evict_uncommitted_boundaries(self, request_id: str) -> int:
++        """Drop from the prefix cache the decode-produced boundary blocks this
++        request hashed in the last hold window. Called before an early free
++        (preemption, abort): on a non-last PP rank those blocks' deferred
++        commits are skipped for a freed row, so their bytes there may be stale.
++        A normal finish keeps them (the worker commits before it frees)."""
++        recent = self._recent_decode_hashed.pop(request_id, None)
++        if not recent:
++            return 0
++        horizon = self._boundary_step - self._boundary_hold_steps
++        ids = {b.block_id for st, b in recent if st >= horizon and b.block_hash is not None}
++        if ids:
++            self.block_pool.evict_blocks(ids)
++        return len(ids)
++
++    def _pin_block(self, block: KVCacheBlock) -> None:
++        (getattr(block, "pool", None) or self.block_pool).touch([block])
++
++    def _unpin_block(self, block: KVCacheBlock) -> None:
++        self.block_pool.free_blocks([block])
++
++    def take_pending_boundary_state_offloads(
++        self,
++    ) -> list[tuple[str, int, KVCacheBlock, int]]:
++        pending = super().take_pending_boundary_state_offloads()
++        if not self._held_boundary_offloads:
++            return pending
++        ripe: list[tuple[str, int, KVCacheBlock, int]] = []
++        keep: list[tuple[int, tuple[str, int, KVCacheBlock, int]]] = []
++        for release_step, entry in self._held_boundary_offloads:
++            if release_step <= self._boundary_step:
++                ripe.append(entry)
++            else:
++                keep.append((release_step, entry))
++        self._held_boundary_offloads = keep
++        # Unpinned here, at the end of the scheduling pass: the connector fences
++        # the block (store job) before any later pass can reallocate it.
++        for entry in ripe:
++            self._unpin_block(entry[2])
++        return pending + ripe
+ 
+     def _block_aligned_prompt_tail(self, request: Request) -> int:
+         """The prompt's tail key when it falls on a block end, else 0.
+diff --git a/vllm/v1/kv_offload/cpu/gpu_worker.py b/vllm/v1/kv_offload/cpu/gpu_worker.py
+index 8db9e80..7913915 100644
+--- a/vllm/v1/kv_offload/cpu/gpu_worker.py
++++ b/vllm/v1/kv_offload/cpu/gpu_worker.py
+@@ -8,6 +8,8 @@ from dataclasses import dataclass
+ from typing import NamedTuple
+ 
+ import numpy as np
++import os
++
+ import torch
+ 
+ from vllm import _custom_ops as ops
+@@ -190,8 +192,29 @@ def _canonical_block_sizes(
+     return canonical_bytes_per_block
+ 
+ 
++def _clear_cuda_last_error() -> None:
++    """Reset CUDA's sticky last error after a failed runtime call. torch's cudart
++    binding has no cudaGetLastError; use the libcudart torch already loaded."""
++    import ctypes
++
++    for name in ("libcudart.so.13", "libcudart.so.12", "libcudart.so"):
++        try:
++            lib = ctypes.CDLL(name, mode=os.RTLD_NOLOAD | ctypes.RTLD_GLOBAL)
++        except OSError:
++            continue
++        lib.cudaGetLastError()
++        return
++
++
+ def pin_mmap_region(region: SharedOffloadRegion) -> None:
+-    """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
++    """Register the entire mmap as CUDA pinned memory via cudaHostRegister.
++
++    Local fix: every worker registers the same shared /dev/shm pages, and concurrent
++    cudaHostRegister calls on them fail with cudaErrorInvalidValue for all but one
++    process (reproduced on this host: 4 in parallel -> 1 ok; one after another, each
++    holding its registration -> 4 ok). Registrations are therefore serialized with a
++    host-wide file lock, and a failed attempt clears CUDA's last error (it would
++    otherwise surface in the next unrelated kernel launch) and is retried."""
+     if not current_platform.is_cuda_alike():
+         logger.info(
+             "Skipping mmap host registration on %s; cudaHostRegister is only "
+@@ -200,22 +223,41 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
+         )
+         return
+ 
+-    rank = region.rank
++    import fcntl
++    import time
+ 
++    rank = region.rank
+     base_ptr = region._base.data_ptr()
+-    result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
++    lock_fd = os.open("/dev/shm/vllm_offload_hostregister.lock", os.O_CREAT | os.O_RDWR, 0o600)
++    try:
++        fcntl.flock(lock_fd, fcntl.LOCK_EX)
++        t0 = time.monotonic()
++        for attempt in range(3):
++            result = torch.cuda.cudart().cudaHostRegister(
++                base_ptr, region.total_size_bytes, 0
++            )
++            if result.value == 0:
++                break
++            _clear_cuda_last_error()
++            time.sleep(1.0)
++    finally:
++        fcntl.flock(lock_fd, fcntl.LOCK_UN)
++        os.close(lock_fd)
+     if result.value != 0:
+         logger.warning(
+-            "cudaHostRegister failed for rank=%d (code=%d) — "
++            "cudaHostRegister failed for rank=%d (code=%d, %.2f GB, 3 attempts) — "
+             "transfers will still work but may be slower (unpinned DMA)",
+             rank,
+             result,
++            region.total_size_bytes / 1e9,
+         )
+     else:
+-        logger.debug(
+-            "cudaHostRegister rank=%d %.2f GB",
++        logger.info(
++            "cudaHostRegister rank=%d %.2f GB in %.1f s (attempt %d)",
+             rank,
+             region.total_size_bytes / 1e9,
++            time.monotonic() - t0,
++            attempt + 1,
+         )
+         region.is_pinned = True
+ 
+diff --git a/vllm/v1/kv_offload/cpu/shared_offload_region.py b/vllm/v1/kv_offload/cpu/shared_offload_region.py
+index 46a1e7a..04b0f86 100644
+--- a/vllm/v1/kv_offload/cpu/shared_offload_region.py
++++ b/vllm/v1/kv_offload/cpu/shared_offload_region.py
+@@ -22,7 +22,7 @@ logger = init_logger(__name__)
+ _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+ 
+ 
+-def _wait_for_file_size(fd: int, expected_size: int, timeout: float = 30.0) -> None:
++def _wait_for_file_size(fd: int, expected_size: int, timeout: float = 600.0) -> None:  # local: was 30 s; a 32 GiB populate can take longer
+     """Spin-wait until the file reaches expected_size (creator truncated it)."""
+     deadline = time.monotonic() + timeout
+     while True:
+diff --git a/vllm/v1/worker/gpu/kv_connector.py b/vllm/v1/worker/gpu/kv_connector.py
+index 88b7b0c..f112a70 100644
+--- a/vllm/v1/worker/gpu/kv_connector.py
++++ b/vllm/v1/worker/gpu/kv_connector.py
+@@ -32,6 +32,9 @@ class KVConnector:
+     def pre_forward(self, scheduler_output: "SchedulerOutput", **kwargs: Any) -> None:
+         pass
+ 
++    def handle_preemptions(self, scheduler_output: "SchedulerOutput") -> None:
++        pass
++
+     def finish_forward(self) -> None:
+         pass
+ 
+@@ -62,6 +65,9 @@ class ActiveKVConnector(KVConnector):
+ 
+         self._pending_load_kwargs: dict[str, Any] | None = None
+         self._disabled = False
++        # Set when the runner already submitted this step's deferred stores and flushes
++        # (handle_preemptions below) before touching any block; pre_forward then skips it.
++        self._preemptions_handled = False
+ 
+     def pre_forward(self, scheduler_output: "SchedulerOutput", **kwargs: Any) -> None:
+         if self._disabled:
+@@ -69,7 +75,9 @@ class ActiveKVConnector(KVConnector):
+ 
+         kv_connector_metadata = scheduler_output.kv_connector_metadata
+         assert kv_connector_metadata is not None
+-        self.kv_connector.handle_preemptions(kv_connector_metadata)
++        if not self._preemptions_handled:
++            self.kv_connector.handle_preemptions(kv_connector_metadata)
++        self._preemptions_handled = False
+         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
+         self._pending_load_kwargs = kwargs
+ 
+@@ -79,6 +87,21 @@ class ActiveKVConnector(KVConnector):
+         # Otherwise start the async load after forward to keep submission
+         # off the critical path.
+ 
++    def handle_preemptions(self, scheduler_output: "SchedulerOutput") -> None:
++        """Submit the previous step's deferred stores and flush (and wait for) the
++        stores of preempted requests, before this step frees, reassigns, zeroes or
++        copies any block. Same point in the step as the V1 runner, which calls it
++        before _update_states; pre_forward would be too late: by then
++        update_requests has zeroed new blocks and applied copy-on-write copies, so a
++        store whose source block was handed to another request copies the wrong data."""
++        if self._disabled:
++            return
++        kv_connector_metadata = scheduler_output.kv_connector_metadata
++        if kv_connector_metadata is None:
++            return
++        self.kv_connector.handle_preemptions(kv_connector_metadata)
++        self._preemptions_handled = True
++
+     def _start_load_kv(self) -> None:
+         load_kwargs = self._pending_load_kwargs
+         assert load_kwargs is not None
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index bc0e37c..bb83954 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1840,6 +1840,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             e2_toggles.maybe_emit()
+             # Update the request states.
+             self.update_pp_decode_requests()
++            # KV offload: submit deferred stores and flush preempted requests' stores
++            # before any block below is freed, reassigned, zeroed or copied (the V1
++            # runner's order); after the deferred PP commits above, so a store never
++            # copies a block whose commit is still pending.
++            self.kv_connector.handle_preemptions(scheduler_output)
+             self.finish_requests(scheduler_output)
+             self.free_states(scheduler_output)
+             self.add_requests(scheduler_output)
+-- 
+2.53.0
+

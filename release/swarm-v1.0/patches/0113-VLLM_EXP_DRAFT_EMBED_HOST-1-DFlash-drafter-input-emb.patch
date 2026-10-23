@@ -1,0 +1,68 @@
+From 3e7a7c1e944a42190e073e3c7f544543dd0b8a68 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 02:14:37 +0300
+Subject: [PATCH 113/138] VLLM_EXP_DRAFT_EMBED_HOST=1: DFlash drafter input
+ embedding in pinned host memory via a UVA view (~636 MB/GPU freed on the last
+ PP stage, which OOMs first: W12 G1/G1b)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/model_executor/models/qwen3_dflash.py | 28 ++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index 5504304..7804b17 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import io
++import os
+ from collections.abc import Iterable
+ 
+ import torch
+@@ -52,6 +53,13 @@ from .utils import (
+ 
+ logger = init_logger(__name__)
+ 
++# local (2026-10-21): VLLM_EXP_DRAFT_EMBED_HOST=1 keeps the drafter's input embedding
++# in pinned host memory, read through a UVA view. Under PP the drafter carries its own
++# copy of the target embedding on the last stage (~636 MB per GPU at TP2 for a 248K x
++# 2560 table), the stage that runs out of memory first; a draft step looks up only a
++# few dozen rows (~5 KB each over PCIe).
++_DRAFT_EMBED_HOST = os.environ.get("VLLM_EXP_DRAFT_EMBED_HOST", "0") == "1"
++
+ 
+ _SLIDING_ATTENTION = "sliding_attention"
+ 
+@@ -845,6 +853,26 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+         loader = AutoWeightsLoader(self)
+         loader.load_weights(model_weights.items(), mapper=mapper)
+         self.model._build_fused_kv_buffers()
++        if _DRAFT_EMBED_HOST:
++            self._move_embedding_to_host()
++
++    def _move_embedding_to_host(self) -> None:
++        from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
++
++        weight = self.model.embed_tokens.weight
++        if not weight.is_cuda:
++            return
++        nbytes = weight.numel() * weight.element_size()
++        host = torch.empty(weight.shape, dtype=weight.dtype, pin_memory=True)
++        host.copy_(weight.data)
++        # The pinned storage must outlive the view.
++        self._embed_tokens_host = host
++        weight.data = get_accelerator_view_from_cpu_tensor(host)
++        torch.cuda.empty_cache()
++        logger.info(
++            "DFlash drafter embedding moved to pinned host memory (UVA view): "
++            "%.0f MiB of GPU memory freed", nbytes / 2**20,
++        )
+ 
+     def _read_mask_embedding(self) -> torch.Tensor | None:
+         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.
+-- 
+2.53.0
+

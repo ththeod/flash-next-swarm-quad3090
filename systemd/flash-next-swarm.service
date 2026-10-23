@@ -1,0 +1,24 @@
+# Install: copy to /etc/systemd/system/, set User/Group and the repo path (/opt/flash-next-swarm-quad3090 below), then
+#   sudo systemctl daemon-reload && sudo systemctl enable --now flash-next-swarm
+[Unit]
+Description=flash-next-swarm-quad3090: Swift 1.5 (Qwen3.8-Flash-Next) on 4x RTX 3090
+After=network-online.target gpu-power.service
+Wants=network-online.target
+
+[Service]
+User=llm
+Group=llm
+WorkingDirectory=/opt/flash-next-swarm-quad3090
+ExecStart=/opt/flash-next-swarm-quad3090/scripts/run-swarm.sh
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=0
+TimeoutStopSec=60
+LimitNOFILE=1048576
+# the RAM tier is pinned with cudaHostRegister
+LimitMEMLOCK=infinity
+# the 49 GiB n-gram table must never be swapped: a swapped-out row stalls every request that touches it
+MemorySwapMax=0
+
+[Install]
+WantedBy=multi-user.target

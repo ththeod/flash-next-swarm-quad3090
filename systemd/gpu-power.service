@@ -1,0 +1,19 @@
+# Persistence mode, per-GPU power caps and the graphics clock lock at boot. Settings: /etc/default/gpu-power
+# (example: systemd/gpu-power.example). Read docs/swarm/power-and-clocks.md first.
+[Unit]
+Description=Persistence mode, power limits and clock lock on all NVIDIA GPUs
+After=nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/default/gpu-power
+ExecStart=/usr/bin/nvidia-smi -pm 1
+ExecStart=/usr/bin/nvidia-smi -pl ${GPU_POWER_LIMIT}
+ExecStart=/bin/sh -c 'for e in $${GPU_POWER_LIMITS:-}; do /usr/bin/nvidia-smi -i "$${e%%%%=*}" -pl "$${e#*=}"; done'
+ExecStart=/bin/sh -c 'if [ "${GPU_MAX_CLOCK:-0}" -gt 0 ]; then /usr/bin/nvidia-smi -lgc 210,${GPU_MAX_CLOCK}; else /usr/bin/nvidia-smi -rgc; fi'
+ExecStop=/usr/bin/nvidia-smi -rgc
+
+[Install]
+WantedBy=multi-user.target

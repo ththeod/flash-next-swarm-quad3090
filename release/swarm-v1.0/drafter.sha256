@@ -1,0 +1,3 @@
+# SHA-256 of incoai/Qwen3.8-Flash-Next-DFlash2 at revision a22a1744e85c17364dcc54a6a420af7135d4c7f6 (the two files the graft uses).
+2409575986f9ea24d455343eb469c0e6940def5edab1d1be503bb8eb4cc3b1b9  config.json
+d6723f2a359eaf33ec0c95f22ae8edda896774020c552296a85e1913b4d3186f  model.safetensors

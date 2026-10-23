@@ -1,0 +1,102 @@
+From 1048ce97c33ac15aa8ade00f24bef533779eb020 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 00:10:57 +0300
+Subject: [PATCH 110/138] fix: async KV loads skip zeroing only in
+ prefix-cacheable groups (DFlash scratch window kept stale bytes after
+ RAM-tier hits -> NaN drafts -> token 0 runaway); VLLM_EXP_DRAFT_NAN_GUARD
+ (default on) zeroes non-finite draft rows
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/core/kv_cache_manager.py             | 26 +++++++++++++++++---
+ vllm/v1/worker/gpu/spec_decode/speculator.py | 15 +++++++++++
+ 2 files changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 9566daa..c07cd8a 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import itertools
++import os
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+ from typing import Literal, overload
+@@ -28,6 +29,10 @@ from vllm.v1.kv_cache_interface import (
+ from vllm.v1.metrics.stats import PrefixCacheStats
+ from vllm.v1.request import Request, RequestStatus
+ 
++# Test only: VLLM_EXP_BUG_SKIP_SCRATCH_ZERO=1 restores the pre-2026-10-21 skip of
++# non-cacheable groups' zeroing on async loads (reproduces the DFlash NaN bug).
++_EXP_BUG_SKIP_SCRATCH_ZERO = os.environ.get("VLLM_EXP_BUG_SKIP_SCRATCH_ZERO", "0") == "1"
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -1282,10 +1287,25 @@ class KVCacheManager:
+         self, request_id: str, start_token: int, end_token: int
+     ) -> list[int]:
+         """The request's block ids covering [start_token, end_token), from
+-        the groups whose new blocks are zeroed by the worker."""
++        the groups whose new blocks are zeroed by the worker.
++
++        Only prefix-cacheable groups: these ids are skipped from zeroing because
++        an async KV load will overwrite them, and KV connectors load only
++        prefix-cacheable groups. A non-cacheable group that records new blocks
++        (local ScratchSlidingWindowSpec: the DFlash 2 drafter's window) gets
++        nothing from the load, so skipping its zeroing left the window over the
++        loaded range holding a previous owner's bytes -- NaN draft logits, and
++        probabilistic verification then emitted token 0 on every step
++        (2026-10-21, after RAM-tier hits)."""
+         ids: list[int] = []
+-        for mgr in self.coordinator.single_type_managers:
+-            if mgr.records_new_block_ids:
++        for mgr, group in zip(
++            self.coordinator.single_type_managers,
++            self.kv_cache_config.kv_cache_groups,
++            strict=True,
++        ):
++            if mgr.records_new_block_ids and (
++                group.kv_cache_spec.prefix_cacheable or _EXP_BUG_SKIP_SCRATCH_ZERO
++            ):
+                 start_idx = start_token // mgr.block_size
+                 end_idx = cdiv(end_token, mgr.block_size)
+                 blocks = mgr.req_to_blocks[request_id]
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index 299cac6..cfffe46 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -43,6 +43,16 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
++# local: a draft row holding NaN or +inf (e.g. a drafter cache window that
++# kept stale bytes) makes probabilistic verification emit token 0 on every
++# step. VLLM_EXP_DRAFT_NAN_GUARD=1 (default) zeroes such a row before it is
++# sampled and cached: the draft comes from, and is verified against, the same
++# uniform q, so the output distribution stays the target's (only acceptance
++# drops for that row). Graph-safe (no host sync).
++import os as _os
++
++_DRAFT_NAN_GUARD = _os.environ.get("VLLM_EXP_DRAFT_NAN_GUARD", "1") == "1"
++
+ 
+ def _target_feeds_hc_residual(vllm_config: VllmConfig) -> bool:
+     """Whether the target replaces the drafter's input with its HC residual.
+@@ -409,6 +419,11 @@ class DraftModelSpeculator(BaseSpeculator):
+     ) -> torch.Tensor:
+         if draft_logits is not None:
+             logits = self.model.compute_logits(hidden_states)
++            if _DRAFT_NAN_GUARD:
++                bad_row = (torch.isnan(logits) | (logits == float("inf"))).any(
++                    dim=-1, keepdim=True
++                )
++                logits = logits.masked_fill(bad_row, 0.0)
+             sampled = gumbel_sample(
+                 logits,
+                 idx_mapping,
+-- 
+2.53.0
+

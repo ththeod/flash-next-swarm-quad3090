@@ -1,0 +1,465 @@
+From 74aec55a2849d70015149fb1567e4727c74a21ff Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 12:15:56 +0300
+Subject: [PATCH 116/138] VLLM_EXP_MOE_SMALL: small-batch Triton MoE routing
+ kernels (moe_sum on by default)
+
+Triton versions of topk_softmax, moe_align_block_size (one launch, numel <=
+1024) and moe_sum for <= 64 tokens, with the CUDA ops' outputs and layouts
+(W24 moe_small_test: equal expert ids, identical align layout, bit-exact sums).
+Timing at 8 tokens (CUDA graph): moe_sum 6.1 -> 2.0 us; topk_softmax 7.9 ->
+7.7 us (no gain); the one-launch align 6.8 -> 17.1 us (loses: single-program
+histogram + sort). VLLM_EXP_MOE_SMALL=1 therefore enables only moe_sum;
+"topk,align,sum" selects kernels explicitly.
+
+W24 B (p6 config + custom all-reduce + this): greedy single code/prose/count
+297.2/128.8/397.7 (custom all-reduce alone 293.8/127.5/391.0, p6 281.2/121.7/
+373.8); probes 8/8 x2 token-identical to A, NaN poke clean, GSM8K 98.0
+(126 s, 491 tok/s), 0 runtime errors.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../layers/fused_moe/experts/marlin_moe.py    |  13 +-
+ .../layers/fused_moe/moe_align_block_size.py  |  31 +-
+ .../fused_moe/router/fused_topk_router.py     |  13 +-
+ .../layers/fused_moe/small_batch_triton.py    | 304 ++++++++++++++++++
+ 4 files changed, 349 insertions(+), 12 deletions(-)
+ create mode 100644 vllm/model_executor/layers/fused_moe/small_batch_triton.py
+
+diff --git a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+index 378b6a2..7fa6c6f 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+@@ -8,6 +8,7 @@ from collections.abc import Callable
+ import torch
+ 
+ import vllm._custom_ops as ops
++from vllm.model_executor.layers.fused_moe import small_batch_triton
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+ from vllm.model_executor.layers.fused_moe.activation import (
+     ApplyMoEActivationConfig,
+@@ -364,7 +365,11 @@ def fused_marlin_moe(
+ 
+     if moe_sum is None:
+         if expert_map is not None:
+-            ops.moe_sum(moe_output, output, topk_ids, expert_map)
++            if not (
++                small_batch_triton.SUM
++                and small_batch_triton.moe_sum(moe_output, output, topk_ids, expert_map)
++            ):
++                ops.moe_sum(moe_output, output, topk_ids, expert_map)
+             return output
+         return torch.sum(moe_output.view(-1, topk, K), dim=1, out=output)
+     else:
+@@ -860,7 +865,11 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
+         expert_map: torch.Tensor | None,
+     ) -> None:
+         if expert_map is not None:
+-            ops.moe_sum(input, output, topk_ids, expert_map)
++            if not (
++                small_batch_triton.SUM
++                and small_batch_triton.moe_sum(input, output, topk_ids, expert_map)
++            ):
++                ops.moe_sum(input, output, topk_ids, expert_map)
+         else:
+             ops.moe_sum(input, output)
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+index 7fc8bfc..e873545 100644
+--- a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
++++ b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+@@ -4,6 +4,7 @@
+ import torch
+ 
+ from vllm import _custom_ops as ops
++from vllm.model_executor.layers.fused_moe import small_batch_triton
+ from vllm.triton_utils import triton
+ from vllm.utils.math_utils import round_up
+ 
+@@ -87,15 +88,27 @@ def moe_align_block_size(
+     )
+     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+ 
+-    ops.moe_align_block_size(
+-        topk_ids,
+-        num_experts,
+-        block_size,
+-        sorted_ids,
+-        expert_ids,
+-        num_tokens_post_pad,
+-        expert_map if ignore_invalid_experts else None,
+-    )
++    if not (
++        small_batch_triton.ALIGN
++        and small_batch_triton.moe_align_block_size(
++            topk_ids,
++            num_experts,
++            block_size,
++            sorted_ids,
++            expert_ids,
++            num_tokens_post_pad,
++            expert_map if ignore_invalid_experts else None,
++        )
++    ):
++        ops.moe_align_block_size(
++            topk_ids,
++            num_experts,
++            block_size,
++            sorted_ids,
++            expert_ids,
++            num_tokens_post_pad,
++            expert_map if ignore_invalid_experts else None,
++        )
+ 
+     if expert_map is not None and not ignore_invalid_experts:
+         expert_ids = expert_map[expert_ids]
+diff --git a/vllm/model_executor/layers/fused_moe/router/fused_topk_router.py b/vllm/model_executor/layers/fused_moe/router/fused_topk_router.py
+index 28f67b5..8aacbe2 100644
+--- a/vllm/model_executor/layers/fused_moe/router/fused_topk_router.py
++++ b/vllm/model_executor/layers/fused_moe/router/fused_topk_router.py
+@@ -5,6 +5,7 @@ from collections.abc import Callable
+ import torch
+ 
+ import vllm._custom_ops as ops
++from vllm.model_executor.layers.fused_moe import small_batch_triton
+ import vllm.envs as envs
+ from vllm._aiter_ops import rocm_aiter_ops
+ from vllm.distributed.eplb.eplb_state import EplbLayerState
+@@ -30,13 +31,23 @@ def vllm_topk_softmax(
+     gating_output: torch.Tensor,
+     renormalize: bool = False,
+ ) -> tuple[torch.Tensor, ...]:
++    is_padding = _get_padding_mask(topk_indices.shape[0])
++    if small_batch_triton.TOPK and small_batch_triton.topk_softmax(
++        topk_weights,
++        topk_indices,
++        token_expert_indices,
++        gating_output,
++        renormalize,
++        is_padding,
++    ):
++        return topk_weights, topk_indices
+     ops.topk_softmax(
+         topk_weights,
+         topk_indices,
+         token_expert_indices,
+         gating_output,
+         renormalize,
+-        is_padding=_get_padding_mask(topk_indices.shape[0]),
++        is_padding=is_padding,
+     )
+ 
+     return topk_weights, topk_indices
+diff --git a/vllm/model_executor/layers/fused_moe/small_batch_triton.py b/vllm/model_executor/layers/fused_moe/small_batch_triton.py
+new file mode 100644
+index 0000000..d17b713
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/small_batch_triton.py
+@@ -0,0 +1,304 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Small-batch MoE routing kernels, VLLM_EXP_MOE_SMALL=1.
++
++At decode / speculative-verify batch sizes (8-64 tokens) the routing kernels
++around the Marlin expert GEMMs are latency-bound: topk_softmax runs one warp
++per token, moe_align_block_size takes two launches (count + sort) because the
++single-launch path only covers <= 64 experts, and moe_sum runs few blocks.
++Together they cost ~25 us per MoE layer on a 3090 (2026-10-21 decode profile,
++Qwen3.8-Flash-Next, 512 experts, top-10). These Triton versions keep the same
++outputs and layouts:
++
++- topk_softmax: fp32 softmax, iterative top-k with ties to the lower expert id,
++  optional renormalization, padding rows get id -1 (VLLM_MOE_SKIP_PADDING).
++- moe_align_block_size: one launch for numel <= 1024; sorted ids are grouped
++  by local expert and padded to block_size exactly as the CUDA kernel does
++  (within an expert, tokens keep their flat order; the CUDA kernel's order
++  there comes from atomics, and Marlin does not depend on it).
++- moe_sum: fp32 sum over top-k in k order, skipping padding / non-local experts.
++"""
++
++import os
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++# "1" = the kernels that beat the CUDA ops in W24 (moe_sum: 6.1 -> 2.0 us at 8 tokens;
++# topk_softmax 7.9 -> 7.7 us was no gain, the one-launch align 6.8 -> 17.1 us lost);
++# or a comma list of topk,align,sum.
++_PARTS = os.environ.get("VLLM_EXP_MOE_SMALL", "0")
++_SET = {"sum"} if _PARTS == "1" else {p for p in _PARTS.split(",") if p not in ("", "0")}
++TOPK = "topk" in _SET
++ALIGN = "align" in _SET
++SUM = "sum" in _SET
++ENABLED = bool(_SET)
++MAX_TOKENS = 64
++MAX_NUMEL = 1024
++
++
++@triton.jit
++def _topk_softmax_kernel(
++    logits_ptr,
++    w_ptr,
++    ids_ptr,
++    src_ptr,
++    pad_ptr,
++    M,
++    E,
++    stride_l,
++    K: tl.constexpr,
++    KP: tl.constexpr,
++    BLOCK_E: tl.constexpr,
++    RENORM: tl.constexpr,
++    HAS_PAD: tl.constexpr,
++):
++    row = tl.program_id(0)
++    offs = tl.arange(0, BLOCK_E)
++    emask = offs < E
++    x = tl.load(logits_ptr + row * stride_l + offs, mask=emask, other=float("-inf"))
++    x = x.to(tl.float32)
++    mx = tl.max(x, 0)
++    ex = tl.where(emask, tl.exp(x - mx), 0.0)
++    p = ex * (1.0 / tl.sum(ex, 0))
++    p = tl.where((p != p) | (tl.abs(p) == float("inf")), 0.0, p)
++    choice = tl.where(emask, p, -20000.0)
++    is_pad = False
++    if HAS_PAD:
++        is_pad = tl.load(pad_ptr + row) != 0
++    koffs = tl.arange(0, KP)
++    vals = tl.zeros((KP,), dtype=tl.float32)
++    idxs = tl.zeros((KP,), dtype=tl.int32)
++    total = 0.0
++    for k in tl.static_range(K):
++        best = tl.max(choice, 0)
++        idx = tl.argmax(choice, 0, tie_break_left=True).to(tl.int32)
++        vals = tl.where(koffs == k, best, vals)
++        idxs = tl.where(koffs == k, idx, idxs)
++        total += best
++        choice = tl.where(offs == idx, -10000.0, choice)
++    if RENORM:
++        vals = vals / tl.where(total > 0.0, total, 1.0)
++    if HAS_PAD:
++        idxs = tl.where(is_pad, -1, idxs)
++    kmask = koffs < K
++    tl.store(w_ptr + row * K + koffs, vals, mask=kmask)
++    tl.store(ids_ptr + row * K + koffs, idxs.to(ids_ptr.dtype.element_ty), mask=kmask)
++    tl.store(src_ptr + row * K + koffs, koffs * M + row, mask=kmask)
++
++
++def topk_softmax(
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    token_expert_indices: torch.Tensor,
++    gating_output: torch.Tensor,
++    renormalize: bool,
++    is_padding: torch.Tensor | None,
++) -> bool:
++    """Fill the outputs like ops.topk_softmax; False when the shape is not
++    covered (caller falls back)."""
++    m, e = gating_output.shape
++    k = topk_ids.shape[1]
++    if (
++        m > MAX_TOKENS
++        or e > 2048
++        or gating_output.stride(1) != 1
++        or not topk_weights.is_contiguous()
++        or not topk_ids.is_contiguous()
++        or not token_expert_indices.is_contiguous()
++    ):
++        return False
++    if m == 0:
++        return True
++    pad = is_padding if is_padding is not None else topk_ids
++    _topk_softmax_kernel[(m,)](
++        gating_output,
++        topk_weights,
++        topk_ids,
++        token_expert_indices,
++        pad,
++        m,
++        e,
++        gating_output.stride(0),
++        K=k,
++        KP=triton.next_power_of_2(k),
++        BLOCK_E=triton.next_power_of_2(e),
++        RENORM=renormalize,
++        HAS_PAD=is_padding is not None,
++        num_warps=4,
++    )
++    return True
++
++
++@triton.jit
++def _moe_align_small_kernel(
++    topk_ids_ptr,
++    emap_ptr,
++    sorted_ptr,
++    expert_ids_ptr,
++    ntp_ptr,
++    scratch_ptr,
++    numel,
++    num_experts,
++    max_tokens_padded,
++    max_m_blocks,
++    block_size,
++    HAS_MAP: tl.constexpr,
++    NP: tl.constexpr,
++    EP: tl.constexpr,
++    FILL: tl.constexpr,
++):
++    # 1. every sorted slot starts as padding (= numel)
++    foffs = tl.arange(0, FILL)
++    for s in range(0, max_tokens_padded, FILL):
++        tl.store(sorted_ptr + s + foffs, numel, mask=s + foffs < max_tokens_padded)
++    # 2. local expert of every (token, k) slot, -1 when invalid / not local
++    offs = tl.arange(0, NP)
++    valid = offs < numel
++    gid = tl.load(topk_ids_ptr + offs, mask=valid, other=-1).to(tl.int32)
++    ok = valid & (gid >= 0) & (gid < num_experts)
++    if HAS_MAP:
++        lid = tl.load(emap_ptr + gid, mask=ok, other=-1)
++    else:
++        lid = gid
++    lid = tl.where(ok, lid, -1)
++    # 3. per-expert counts, padded to block_size, exclusive prefix sums
++    DUMMY: tl.constexpr = EP - 1
++    counts = tl.histogram(tl.where(lid >= 0, lid, DUMMY), EP)
++    eoffs = tl.arange(0, EP)
++    counts = tl.where(eoffs == DUMMY, 0, counts)
++    padded = (counts + block_size - 1) // block_size * block_size
++    cum_pad = tl.cumsum(padded, 0) - padded
++    cum_cnt = tl.cumsum(counts, 0) - counts
++    total = tl.sum(padded, 0)
++    tl.store(scratch_ptr + eoffs, cum_pad)
++    tl.store(scratch_ptr + EP + eoffs, cum_cnt)
++    tl.debug_barrier()
++    # 4. scatter: sort (expert, flat index) keys; position within the expert
++    #    = sorted position - tokens of lower experts
++    BIG: tl.constexpr = EP * NP
++    keys = tl.where(lid >= 0, lid * NP + offs, BIG)
++    sk = tl.sort(keys)
++    has = sk < BIG
++    ex = tl.where(has, sk // NP, 0)
++    start_pad = tl.load(scratch_ptr + ex, mask=has, other=0)
++    start_cnt = tl.load(scratch_ptr + EP + ex, mask=has, other=0)
++    dest = start_pad + (offs - start_cnt)
++    tl.store(sorted_ptr + dest, sk % NP, mask=has)
++    # 5. expert id of every block, -1 for the unused tail
++    nb = padded // block_size
++    sb = cum_pad // block_size
++    max_nb = tl.max(nb, 0)
++    for j in range(0, max_nb):
++        tl.store(expert_ids_ptr + sb + j, eoffs, mask=j < nb)
++    tail = total // block_size
++    for s in range(0, max_m_blocks, FILL):
++        o = s + foffs
++        tl.store(expert_ids_ptr + o, -1, mask=(o >= tail) & (o < max_m_blocks))
++    tl.store(ntp_ptr, total)
++
++
++def moe_align_block_size(
++    topk_ids: torch.Tensor,
++    num_experts: int,
++    block_size: int,
++    sorted_ids: torch.Tensor,
++    expert_ids: torch.Tensor,
++    num_tokens_post_pad: torch.Tensor,
++    expert_map: torch.Tensor | None,
++) -> bool:
++    """One-launch ops.moe_align_block_size for small batches (expert_map, if
++    given, maps global -> local ids with -1 for non-local experts, as with
++    ignore_invalid_experts). False when not covered (caller falls back)."""
++    numel = topk_ids.numel()
++    if numel > MAX_NUMEL or num_experts > 1023 or not topk_ids.is_contiguous():
++        return False
++    if expert_map is not None and expert_map.dtype != torch.int32:
++        return False
++    ep = triton.next_power_of_2(num_experts + 1)
++    scratch = torch.empty(2 * ep, dtype=torch.int32, device=topk_ids.device)
++    _moe_align_small_kernel[(1,)](
++        topk_ids,
++        expert_map if expert_map is not None else topk_ids,
++        sorted_ids,
++        expert_ids,
++        num_tokens_post_pad,
++        scratch,
++        numel,
++        num_experts,
++        sorted_ids.numel(),
++        expert_ids.numel(),
++        block_size,
++        HAS_MAP=expert_map is not None,
++        NP=max(16, triton.next_power_of_2(numel)),
++        EP=ep,
++        FILL=1024,
++        num_warps=8,
++    )
++    return True
++
++
++@triton.jit
++def _moe_sum_kernel(
++    in_ptr,
++    out_ptr,
++    ids_ptr,
++    emap_ptr,
++    H,
++    stride_im,
++    stride_ik,
++    stride_om,
++    K: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    HAS_MAP: tl.constexpr,
++):
++    m = tl.program_id(0)
++    offs = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
++    hmask = offs < H
++    acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
++    for k in tl.static_range(K):
++        gid = tl.load(ids_ptr + m * K + k).to(tl.int32)
++        use = gid >= 0
++        if HAS_MAP:
++            use = use & (tl.load(emap_ptr + tl.where(use, gid, 0)) >= 0)
++        x = tl.load(in_ptr + m * stride_im + k * stride_ik + offs, mask=hmask & use, other=0.0)
++        acc += x.to(tl.float32)
++    tl.store(out_ptr + m * stride_om + offs, acc.to(out_ptr.dtype.element_ty), mask=hmask)
++
++
++def moe_sum(
++    input: torch.Tensor,
++    output: torch.Tensor,
++    topk_ids: torch.Tensor,
++    expert_map: torch.Tensor | None,
++) -> bool:
++    """output[m] = sum over k of input[m, k], skipping padding (id < 0) and
++    non-local experts; fp32 accumulation in k order like ops.moe_sum."""
++    m, k, h = input.shape
++    if (
++        m > MAX_TOKENS
++        or input.stride(2) != 1
++        or not output.is_contiguous()
++        or not topk_ids.is_contiguous()
++        or (expert_map is not None and expert_map.dtype != torch.int32)
++    ):
++        return False
++    if m == 0:
++        return True
++    block_h = 512
++    _moe_sum_kernel[(m, triton.cdiv(h, block_h))](
++        input,
++        output,
++        topk_ids,
++        expert_map if expert_map is not None else topk_ids,
++        h,
++        input.stride(0),
++        input.stride(1),
++        output.stride(0),
++        K=k,
++        BLOCK_H=block_h,
++        HAS_MAP=expert_map is not None,
++        num_warps=4,
++    )
++    return True
+-- 
+2.53.0
+

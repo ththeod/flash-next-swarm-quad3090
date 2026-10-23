@@ -1,0 +1,294 @@
+From 30ec79f8c54682c1847e949db4fbfaee80978665 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 12:49:49 +0300
+Subject: [PATCH 117/138] experimental (not deployed): token-space moe_align +
+ VLLM_EXP_TOPK_FIRST sampler path
+
+- moe_align_block_size small-batch kernel rewritten in token-slot space (sort,
+  segment scans, numel <= ALIGN_MAX_NUMEL = 256): 6.9 -> 4.4 us at 80 slots,
+  5.1 at 160, tie at 320, 13.6 vs 7.0 at 640 (W25). Select with
+  VLLM_EXP_MOE_SMALL=sum,align.
+- VLLM_EXP_TOPK_FIRST=1: top-k-first top-k/top-p (torch.topk of the largest
+  per-row top-k, values cut-off). Masks identical to the Triton kernel and the
+  sort reference, but torch.topk over 248K logits is itself ~360 us: no faster
+  at 8 rows (360 vs 377 us), slower at 32-48 rows. Left off.
+
+W25 server (p7 config + sum,align): greedy single 297.4/128.9/395.6 vs p7
+298.9/128.7/396.8 (no measurable change), probes token-identical, NaN poke
+clean, GSM8K 96.5 (120 s, 490 tok/s), 0 runtime errors. Production stays p7.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../layers/fused_moe/small_batch_triton.py    | 93 +++++++++++--------
+ vllm/v1/sample/ops/topk_topp_sampler.py       | 46 ++++++++-
+ vllm/v1/worker/gpu/sample/sampler.py          | 11 ++-
+ vllm/v1/worker/gpu/sample/states.py           |  8 +-
+ 4 files changed, 117 insertions(+), 41 deletions(-)
+
+diff --git a/vllm/model_executor/layers/fused_moe/small_batch_triton.py b/vllm/model_executor/layers/fused_moe/small_batch_triton.py
+index d17b713..7dadd25 100644
+--- a/vllm/model_executor/layers/fused_moe/small_batch_triton.py
++++ b/vllm/model_executor/layers/fused_moe/small_batch_triton.py
+@@ -12,10 +12,11 @@ outputs and layouts:
+ 
+ - topk_softmax: fp32 softmax, iterative top-k with ties to the lower expert id,
+   optional renormalization, padding rows get id -1 (VLLM_MOE_SKIP_PADDING).
+-- moe_align_block_size: one launch for numel <= 1024; sorted ids are grouped
+-  by local expert and padded to block_size exactly as the CUDA kernel does
+-  (within an expert, tokens keep their flat order; the CUDA kernel's order
+-  there comes from atomics, and Marlin does not depend on it).
++- moe_align_block_size: one launch for numel <= 1024, in token-slot space
++  (sort + segment scan); sorted ids are grouped by local expert and padded to
++  block_size exactly as the CUDA kernel does (within an expert, tokens keep
++  their flat order; the CUDA kernel's order there comes from atomics, and
++  Marlin does not depend on it).
+ - moe_sum: fp32 sum over top-k in k order, skipping padding / non-local experts.
+ """
+ 
+@@ -36,6 +37,7 @@ SUM = "sum" in _SET
+ ENABLED = bool(_SET)
+ MAX_TOKENS = 64
+ MAX_NUMEL = 1024
++ALIGN_MAX_NUMEL = 256
+ 
+ 
+ @triton.jit
+@@ -131,6 +133,16 @@ def topk_softmax(
+     return True
+ 
+ 
++@triton.jit
++def _max_fn(a, b):
++    return tl.maximum(a, b)
++
++
++@triton.jit
++def _min_fn(a, b):
++    return tl.minimum(a, b)
++
++
+ @triton.jit
+ def _moe_align_small_kernel(
+     topk_ids_ptr,
+@@ -146,9 +158,12 @@ def _moe_align_small_kernel(
+     block_size,
+     HAS_MAP: tl.constexpr,
+     NP: tl.constexpr,
+-    EP: tl.constexpr,
+     FILL: tl.constexpr,
+ ):
++    # Works in token-slot space (numel <= 1024 lanes) instead of expert space:
++    # sort (local expert, slot) keys, find each expert's segment, pad it to
++    # block_size. W24's expert-space version (histogram + scan over 1024
++    # experts) took 17 us vs 6.8 us for the two CUDA kernels.
+     # 1. every sorted slot starts as padding (= numel)
+     foffs = tl.arange(0, FILL)
+     for s in range(0, max_tokens_padded, FILL):
+@@ -163,35 +178,36 @@ def _moe_align_small_kernel(
+     else:
+         lid = gid
+     lid = tl.where(ok, lid, -1)
+-    # 3. per-expert counts, padded to block_size, exclusive prefix sums
+-    DUMMY: tl.constexpr = EP - 1
+-    counts = tl.histogram(tl.where(lid >= 0, lid, DUMMY), EP)
+-    eoffs = tl.arange(0, EP)
+-    counts = tl.where(eoffs == DUMMY, 0, counts)
+-    padded = (counts + block_size - 1) // block_size * block_size
+-    cum_pad = tl.cumsum(padded, 0) - padded
+-    cum_cnt = tl.cumsum(counts, 0) - counts
+-    total = tl.sum(padded, 0)
+-    tl.store(scratch_ptr + eoffs, cum_pad)
+-    tl.store(scratch_ptr + EP + eoffs, cum_cnt)
+-    tl.debug_barrier()
+-    # 4. scatter: sort (expert, flat index) keys; position within the expert
+-    #    = sorted position - tokens of lower experts
+-    BIG: tl.constexpr = EP * NP
+-    keys = tl.where(lid >= 0, lid * NP + offs, BIG)
+-    sk = tl.sort(keys)
++    # 3. group by expert: sorted keys, segment boundaries through a scratch
++    #    copy (neighbour lookups)
++    BIG = (num_experts + 1) * NP
++    sk = tl.sort(tl.where(lid >= 0, lid * NP + offs, BIG))
+     has = sk < BIG
+-    ex = tl.where(has, sk // NP, 0)
+-    start_pad = tl.load(scratch_ptr + ex, mask=has, other=0)
+-    start_cnt = tl.load(scratch_ptr + EP + ex, mask=has, other=0)
+-    dest = start_pad + (offs - start_cnt)
++    ex = tl.where(has, sk // NP, -1)
++    tl.store(scratch_ptr + offs, ex)
++    tl.debug_barrier()
++    e_prev = tl.load(scratch_ptr + offs - 1, mask=offs > 0, other=-2)
++    e_next = tl.load(scratch_ptr + offs + 1, mask=offs + 1 < NP, other=-2)
++    is_first = has & (ex != e_prev)
++    is_last = has & (ex != e_next)
++    seg_start = tl.associative_scan(tl.where(is_first, offs, 0), 0, _max_fn)
++    # 4. padded segment sizes and offsets (known at each segment's last slot,
++    #    then carried back to the whole segment with a reverse min-scan)
++    seg_len = tl.where(is_last, offs - seg_start + 1, 0)
++    seg_pad = (seg_len + block_size - 1) // block_size * block_size
++    pad_end = tl.cumsum(seg_pad, 0)
++    seg_off_last = pad_end - seg_pad
++    seg_off = tl.associative_scan(
++        tl.where(is_last, seg_off_last, 2147483647), 0, _min_fn, reverse=True
++    )
++    total = tl.sum(seg_pad, 0)
++    # 5. scatter slot ids; expert id of every block; -1 for the unused tail
++    dest = seg_off + (offs - seg_start)
+     tl.store(sorted_ptr + dest, sk % NP, mask=has)
+-    # 5. expert id of every block, -1 for the unused tail
+-    nb = padded // block_size
+-    sb = cum_pad // block_size
+-    max_nb = tl.max(nb, 0)
+-    for j in range(0, max_nb):
+-        tl.store(expert_ids_ptr + sb + j, eoffs, mask=j < nb)
++    nblk = seg_pad // block_size
++    sblk = seg_off_last // block_size
++    for j in range(0, tl.max(nblk, 0)):
++        tl.store(expert_ids_ptr + sblk + j, ex, mask=is_last & (j < nblk))
+     tail = total // block_size
+     for s in range(0, max_m_blocks, FILL):
+         o = s + foffs
+@@ -212,12 +228,14 @@ def moe_align_block_size(
+     given, maps global -> local ids with -1 for non-local experts, as with
+     ignore_invalid_experts). False when not covered (caller falls back)."""
+     numel = topk_ids.numel()
+-    if numel > MAX_NUMEL or num_experts > 1023 or not topk_ids.is_contiguous():
++    # W25 (3090, 512 experts, top-10): 6.9 -> 4.4 us at 80 slots, 5.1 at 160, a
++    # tie at 320, slower at 640 (13.6 vs 7.0) -> only up to ALIGN_MAX_NUMEL.
++    if numel > ALIGN_MAX_NUMEL or num_experts > 4096 or not topk_ids.is_contiguous():
+         return False
+     if expert_map is not None and expert_map.dtype != torch.int32:
+         return False
+-    ep = triton.next_power_of_2(num_experts + 1)
+-    scratch = torch.empty(2 * ep, dtype=torch.int32, device=topk_ids.device)
++    np_ = max(16, triton.next_power_of_2(numel))
++    scratch = torch.empty(np_, dtype=torch.int32, device=topk_ids.device)
+     _moe_align_small_kernel[(1,)](
+         topk_ids,
+         expert_map if expert_map is not None else topk_ids,
+@@ -231,10 +249,9 @@ def moe_align_block_size(
+         expert_ids.numel(),
+         block_size,
+         HAS_MAP=expert_map is not None,
+-        NP=max(16, triton.next_power_of_2(numel)),
+-        EP=ep,
++        NP=np_,
+         FILL=1024,
+-        num_warps=8,
++        num_warps=4,
+     )
+     return True
+ 
+diff --git a/vllm/v1/sample/ops/topk_topp_sampler.py b/vllm/v1/sample/ops/topk_topp_sampler.py
+index aeb82de..0d2fe23 100644
+--- a/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ 
++import os
++
+ import torch
+ import torch.nn as nn
+ 
+@@ -365,12 +367,54 @@ def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
+     return probs.div(q).argmax(dim=-1).view(-1)
+ 
+ 
++# VLLM_EXP_TOPK_FIRST=1 (2026-10-21): when every row has a top-k <= 64 and the
++# caller knows the largest one (the V2 sampler reads it from host-side state,
++# no sync), take the top max_k values per row with torch.topk and find the
++# top-k / top-p cut-off among them, instead of the Triton kernel's serial sweep
++# of the whole vocab per row (~0.3 ms per decode step for 8 rows of 248K).
++_TOPK_FIRST = os.environ.get("VLLM_EXP_TOPK_FIRST", "0") == "1"
++_TOPK_FIRST_MAX_K = 64
++
++
++def _apply_top_k_first(
++    logits: torch.Tensor, k: torch.Tensor, p: torch.Tensor | None, max_k: int
++) -> torch.Tensor:
++    vals = logits.topk(max_k, dim=-1).values  # [B, max_k], descending
++    last = k.to(torch.long).clamp(1, max_k) - 1  # position of the k-th largest
++    if p is not None:
++        pos = torch.arange(max_k, device=logits.device)
++        in_k = pos.unsqueeze(0) <= last.unsqueeze(1)
++        probs = vals.masked_fill(~in_k, float("-inf")).softmax(dim=-1)
++        # keep a token while the mass of the larger tokens is still below p
++        before = probs.cumsum(dim=-1) - probs
++        keep = in_k & ((before < p.unsqueeze(1)) | (p.unsqueeze(1) >= 1.0))
++        keep[:, 0] = True
++        last = keep.sum(dim=-1) - 1
++    # values-based cut-off: ties with the last kept value stay, as in the
++    # sort-based reference
++    thr = vals.gather(1, last.unsqueeze(1))
++    return logits.masked_fill_(logits < thr, float("-inf"))
++
++
+ def apply_top_k_top_p(
+-    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
++    logits: torch.Tensor,
++    k: torch.Tensor | None,
++    p: torch.Tensor | None,
++    max_top_k: int | None = None,
+ ) -> torch.Tensor:
+     if p is None and k is None:
+         return logits
+ 
++    if (
++        _TOPK_FIRST
++        and k is not None
++        and max_top_k is not None
++        and 0 < max_top_k <= _TOPK_FIRST_MAX_K
++        and max_top_k <= logits.shape[-1]
++        and logits.is_cuda
++    ):
++        return _apply_top_k_first(logits, k, p, max_top_k)
++
+     if HAS_TRITON:
+         return apply_top_k_top_p_triton(logits, k, p)
+ 
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index b069604..3541c6b 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -330,7 +330,16 @@ class Sampler:
+         if use_flashinfer:
+             sampled = flashinfer_sample(processed_logits, top_k, top_p).to(torch.int64)
+         else:
+-            processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
++            processed_logits = apply_top_k_top_p(
++                processed_logits,
++                top_k,
++                top_p,
++                max_top_k=(
++                    self.sampling_states.max_top_k(idx_mapping_np)
++                    if top_k is not None
++                    else None
++                ),
++            )
+             sampled = gumbel_sample(
+                 processed_logits,
+                 expanded_idx_mapping,
+diff --git a/vllm/v1/worker/gpu/sample/states.py b/vllm/v1/worker/gpu/sample/states.py
+index fe4dee6..c963202 100644
+--- a/vllm/v1/worker/gpu/sample/states.py
++++ b/vllm/v1/worker/gpu/sample/states.py
+@@ -109,7 +109,13 @@ class SamplingStates:
+         top_k, top_p = self.get_top_k_top_p(expanded_idx_mapping, idx_mapping_np)
+         if top_k is None and top_p is None:
+             return logits
+-        return apply_top_k_top_p(logits, top_k, top_p)
++        return apply_top_k_top_p(
++            logits, top_k, top_p, max_top_k=self.max_top_k(idx_mapping_np)
++        )
++
++    def max_top_k(self, idx_mapping_np: np.ndarray) -> int:
++        """Largest top-k among the scheduled requests (host-side, no sync)."""
++        return int(np.max(self.top_k.np[idx_mapping_np]))
+ 
+     def any_greedy(self, idx_mapping_np: np.ndarray) -> bool:
+         return bool(np.any(self.temperature.np[idx_mapping_np] == 0.0))
+-- 
+2.53.0
+

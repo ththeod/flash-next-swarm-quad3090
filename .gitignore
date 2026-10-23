@@ -9,3 +9,11 @@ venv-v2/
 *.bundle
 *.bundle.gz
 *.tar.gz
+# flash-next-swarm-quad3090: installer outputs
+vllm-swarm/
+venv-swarm/
+models/
+cache/
+config/local.env
+bench/results/
+.setup/

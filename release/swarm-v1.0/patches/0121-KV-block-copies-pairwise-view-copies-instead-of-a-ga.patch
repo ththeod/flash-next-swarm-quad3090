@@ -1,0 +1,70 @@
+From 52cd5aa39634fb6850037fb59c03fe2dcff53d85 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 18:55:26 +0300
+Subject: [PATCH 121/138] KV block copies: pairwise view copies instead of a
+ gathered temporary (fixes 18:41 OOM)
+
+copy_kv_cache_blocks_inplace did blocks[dst] = blocks[src], which stages all
+source blocks in a temporary of len(copies) x block bytes. A step with ~35
+copy-on-write copies (fine-grained prefix hits of several requests sharing a
+prefix) asked for 474-490 MiB on every rank with 27-238 MiB free -> OOM,
+engine fail-closed (production 2026-10-21 18:41:40). Copy pair by pair between
+block views (no allocation); keep the gather when a destination is also a
+source (pairwise order would change the result). Byte-identical to the gather
+on 240 randomized fan-out cases over all KV layouts (skinny/copy_blocks_test.py).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/worker/utils.py | 22 +++++++++++++++++-----
+ 1 file changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index c09a0f7..f903b09 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -725,6 +725,13 @@ def copy_kv_cache_blocks_inplace(
+         return
+ 
+     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
++    # Copy pair by pair between block views: the gather `blocks[dst] =
++    # blocks[src]` stages every source block in a temporary, ~0.5 GB for a step
++    # with tens of copy-on-write copies, and that OOMed a server with ~30 MB
++    # free (2026-10-21 18:41). Pairwise copies give the same result unless a
++    # destination is also a source; that case keeps the gather.
++    pairs = indices_np.tolist()
++    pairwise = not (set(indices_np[:, 0].tolist()) & set(indices_np[:, 1].tolist()))
+     indices: torch.Tensor | None = None
+     seen: set[tuple[torch.device, int]] = set()
+     copied_storages: set[tuple[torch.device, int]] = set()
+@@ -736,10 +743,11 @@ def copy_kv_cache_blocks_inplace(
+             continue
+         seen.add(key)
+ 
+-        if indices is None:
+-            indices = async_tensor_h2d(indices_np, device=cache.device)
+-        assert cache.device == indices.device
+-        src, dst = indices.unbind(dim=1)
++        if not pairwise:
++            if indices is None:
++                indices = async_tensor_h2d(indices_np, device=cache.device)
++            assert cache.device == indices.device
++            src, dst = indices.unbind(dim=1)
+ 
+         kernel_blocks_per_block, remainder = divmod(cache.shape[0], num_blocks)
+         assert remainder == 0, (
+@@ -762,7 +770,11 @@ def copy_kv_cache_blocks_inplace(
+             # Fold virtual block splitting into the shape so that dim 0 counts
+             # scheduler blocks; unflatten of dim 0 is always a view.
+             blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
+-        blocks[dst] = blocks[src]
++        if pairwise:
++            for s, d in pairs:
++                blocks[d].copy_(blocks[s])
++        else:
++            blocks[dst] = blocks[src]
+ 
+ 
+ def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:
+-- 
+2.53.0
+

@@ -1,0 +1,41 @@
+From d7ef29d9cfffa9c257acf11ea49420365d68fb5c Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 01:23:50 +0300
+Subject: [PATCH 111/138] fix: VLLM_EXP_DRAFT_NAN_GUARD also on the DFlash 2
+ selector walk (DFlash2Speculator never calls BaseSpeculator.sample_draft, so
+ the guard missed it: W11 F2)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
+index 7db5284..0750ef1 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
+@@ -10,6 +10,7 @@ from vllm.config.compilation import CUDAGraphMode
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
++from vllm.v1.worker.gpu.spec_decode.speculator import _DRAFT_NAN_GUARD
+ 
+ 
+ @triton.jit
+@@ -212,6 +213,13 @@ class DFlash2Speculator(DFlashSpeculator):
+             hidden_states,
+             anchor_token_ids,
+         )
++        if _DRAFT_NAN_GUARD:
++            # DFlash 2 samples through the selector walk, not BaseSpeculator.sample_draft:
++            # a request whose selector scores hold NaN/+inf walks (and caches) uniform
++            # scores over its candidates instead -- same q for drafting and verification.
++            flat = scores.reshape(num_reqs, -1)
++            bad = (torch.isnan(flat) | (flat == float("inf"))).any(dim=-1, keepdim=True)
++            scores = flat.masked_fill(bad, 0.0).view_as(scores)
+         self._sample_path(candidate_ids, scores, num_reqs)
+         if self.enable_adaptive_verification:
+             self._maybe_predict_acceptance(
+-- 
+2.53.0
+

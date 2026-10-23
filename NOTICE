@@ -253,3 +253,106 @@ our host-mapped PLE pull transport builds on it),
 Intel (AutoRound), RadixArk (FP8 PLE table), aikitoria (P2P driver for consumer Ampere), DominikBucko (MTP INT4
 packing recipe), CoolShades (idle-power report, issue #2, and PR #3, behind the v2.5.2 guard fix), alesha-pro,
 noonghunna/club-3090 and tfriedel (independent work on the same hardware class).
+
+================================================================================
+NOTICE - flash-next-swarm-quad3090 v1.0 (a fork of the Flash-Next v2.5.2 release above)
+
+This fork is by ththeod (https://github.com/ththeod), developed with Claude Code. It modifies halt95's Merlin engine
+v2.5.2 (commit de6e2c2fe9e02a9f70a5ff6f313aa45abc43b84c, described above), which is itself a modified version of vLLM;
+both are licensed under the Apache License, Version 2.0 (see LICENSE). Everything above this line is halt95's NOTICE,
+unchanged.
+
+Engine delta: 40 commits, release/swarm-v1.0/patches/0099..0138, bundle release/swarm-v1.0/swarm-v1.0-from-v2.5.2.bundle,
+combined diff release/swarm-v1.0/swarm-v1.0-combined.diff; source commit 4f94a65ecec75c5220f40e6754ff625757695d95, tree
+1c87587efca8563ad2460cece4b451975aedd86c (upstream/PIN-swarm-v1.0).
+Compiled: vllm/_moe_C_stable_libtorch.abi3.so rebuilt from this tree (release asset moe-C-sm86-py313-cu134-swarm-v1.0.tar.gz);
+every other build product is halt95's v2.2.0 artefact or the stock vLLM 0.30.0 wheel's.
+Runtime addition: FlashInfer 0.7.0.post1 (Apache-2.0, https://github.com/flashinfer-ai/flashinfer) and nccl-extensions 0.1.0
+(Apache-2.0).
+Upstream work used in the delta: vLLM PR #57632 by Juntian Liu (DFlash context K/V precompute in the draft CUDA graph,
+backported as patch 0109, co-author trailer in the commit);
+the RecoverSSM single-traversal boundary fix from halt95's Merlin 3.0.0 (patch 0138, co-author trailer). vLLM's FlashInfer
+PCIe IPC all-reduce (upstream vLLM 0.30.0 code, not in the delta) is switched on with FlashInfer 0.7, as halt95 does in
+Merlin 3.0.0. The two W4A8-INT8 Marlin fixes were found independently and match open vLLM PRs
+#61405 (ntovas), #48926 (lazypool) and #59895 (plawanrath).
+
+Per Apache-2.0 section 4(b): relative to the v2.5.2 release commit, 5 files were added and 63 modified
+(`git diff --name-status de6e2c2 4f94a65`).
+
+Added (5):
+  tests/distributed/test_custom_all_reduce_e2_limits.py
+  tests/kernels/moe/test_marlin_moe_int8_signed_scales.py
+  tests/quantization/test_ct_wna16_moe_int8_gscale.py
+  vllm/model_executor/layers/fused_moe/small_batch_triton.py
+  vllm/models/qwen4_exp/nvidia/ops/skinny_sm86.py
+
+Modified (63):
+  csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h
+  csrc/libtorch_stable/quantization/marlin/marlin_template.h
+  tests/kernels/mamba/test_recoverssm_gdn.py
+  tests/test_envs.py
+  tests/v1/core/test_mamba_checkpoint_retention.py
+  tests/v1/core/test_scheduler.py
+  tests/v1/core/test_side_cache_layout.py
+  tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py
+  tests/v1/kv_offload/cpu/test_manager.py
+  tests/v1/worker/test_gpu_batch_ordering.py
+  vllm/config/speculative.py
+  vllm/config/vllm.py
+  vllm/distributed/device_communicators/custom_all_reduce.py
+  vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
+  vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py
+  vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+  vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+  vllm/envs.py
+  vllm/model_executor/layers/attention/attention.py
+  vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+  vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+  vllm/model_executor/layers/fused_moe/router/fused_topk_router.py
+  vllm/model_executor/layers/logits_processor.py
+  vllm/model_executor/layers/mamba/gdn/recoverssm_gdn.py
+  vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16.py
+  vllm/model_executor/layers/quantization/utils/marlin_utils.py
+  vllm/model_executor/layers/vocab_parallel_embedding.py
+  vllm/model_executor/models/config.py
+  vllm/model_executor/models/qwen3_dflash.py
+  vllm/model_executor/models/qwen3_dflash2.py
+  vllm/model_executor/warmup/qwen4_exp_qsa_warmup.py
+  vllm/models/qwen4_exp/common/qsa_cache.py
+  vllm/models/qwen4_exp/nvidia/hyperconnection.py
+  vllm/models/qwen4_exp/nvidia/low_latency_gemm.py
+  vllm/models/qwen4_exp/nvidia/model.py
+  vllm/models/qwen4_exp/nvidia/ops/qsa.py
+  vllm/models/qwen4_exp/nvidia/qsa.py
+  vllm/renderers/base.py
+  vllm/sampling_params.py
+  vllm/v1/core/kv_cache_manager.py
+  vllm/v1/core/kv_cache_utils.py
+  vllm/v1/core/sched/async_scheduler.py
+  vllm/v1/core/sched/scheduler.py
+  vllm/v1/core/single_type_kv_cache_manager.py
+  vllm/v1/e2_guards.py
+  vllm/v1/kv_cache_interface.py
+  vllm/v1/kv_offload/base.py
+  vllm/v1/kv_offload/cpu/common.py
+  vllm/v1/kv_offload/cpu/gpu_worker.py
+  vllm/v1/kv_offload/cpu/manager.py
+  vllm/v1/kv_offload/cpu/shared_offload_region.py
+  vllm/v1/kv_offload/cpu/spec.py
+  vllm/v1/sample/ops/topk_topp_sampler.py
+  vllm/v1/worker/gpu/kv_connector.py
+  vllm/v1/worker/gpu/model_runner.py
+  vllm/v1/worker/gpu/sample/sampler.py
+  vllm/v1/worker/gpu/sample/states.py
+  vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
+  vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+  vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+  vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
+  vllm/v1/worker/gpu/spec_decode/speculator.py
+  vllm/v1/worker/utils.py
+
+Repository files added by this fork (outside the engine): README.md (halt95's README is kept as README-halt95.md),
+setup.sh, upstream/PIN-swarm-v1.0, release/swarm-v1.0/, scripts/build-swarm.sh, scripts/gpu-status.sh, scripts/run-swarm.sh, scripts/size-ram-tier.sh,
+scripts/graft-drafter-embed.py, scripts/serve-swarm.sh (halt95's scripts/serve-v2.5.sh with opt-in knobs added),
+config/, systemd/, bench/, tools/skinny/, docs/swarm/. bench/data/ holds third-party datasets under their own licences
+(bench/data/README.md). .gitignore: lines added for the installer's outputs.

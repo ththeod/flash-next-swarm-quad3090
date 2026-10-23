@@ -1,0 +1,32 @@
+# flash-next-swarm-quad3090 v1.0: the engine source this fork serves with, as a delta on halt95's Merlin engine v2.5.2.
+#   base: halt95's v2.5.2 release commit (upstream/PIN-v2.5: vLLM v0.30.0 + 98 commits by halt95)
+#   + 40 commits (release/swarm-v1.0/patches/0099..0138, reading aid; the series replays with `git am --keep-non-patch` onto
+#     the v2.5.2 commit to the same tree). The bundle is the source artefact; scripts/build-swarm.sh verifies commit AND tree.
+#   The published tree is byte-identical to the tree the reference host serves (same git tree hash).
+base_pin=upstream/PIN-v2.5
+base_commit=de6e2c2fe9e02a9f70a5ff6f313aa45abc43b84c
+base_tree=05e6d1a583e102b32a133ce34519865cacf32c45
+bundle=release/swarm-v1.0/swarm-v1.0-from-v2.5.2.bundle
+bundle_sha256=9b13f32532eb18b46701f201992e585889d135dbdd51f92f16c5d8b670a09c2d
+ref=refs/heads/swarm-v1.0-public
+tag=swarm-v1.0
+commit=4f94a65ecec75c5220f40e6754ff625757695d95
+tree=1c87587efca8563ad2460cece4b451975aedd86c
+# Compiled ops. The delta changes two Marlin templates (csrc/libtorch_stable/{moe/marlin_moe_wna16,quantization/marlin}/
+# marlin_template.h: INT8-activation group scales read as signed). Only the MoE one is on this model's path, so the release
+# ships one rebuilt extension; _C_stable_libtorch stays halt95's v2.2.0 build (own_C_sha256 in PIN-v2.5), which still has
+# the old dense template. BUILD_OWN=1 rebuilds both from this tree.
+moe_C=vllm/_moe_C_stable_libtorch.abi3.so
+moe_C_sha256=972f82b8afc09ee00823d257a135efe238ac4cf9bf48af1ee3769983b6f110a6
+moe_C_tar=moe-C-sm86-py313-cu134-swarm-v1.0.tar.gz
+moe_C_tar_sha256=7d94181ca8b019923da088a3a94931e0afb755603532814f1ed1a345adb3c76f
+moe_C_url=https://github.com/ththeod/flash-next-swarm-quad3090/releases/download/swarm-v1.0/moe-C-sm86-py313-cu134-swarm-v1.0.tar.gz
+# the reference build: Ubuntu 26.04 host (glibc 2.43, gcc 15.2), CUDA 13.4 (nvcc V13.4.92), cmake + ninja, Release,
+# TORCH_CUDA_ARCH_LIST=8.6 (SASS sm_80 + sm_86, PTX sm_80). The product needs glibc >= 2.38 (Ubuntu 24.04, Debian 13 or
+# newer); on older systems use BUILD_OWN=1.
+build_cuda=13.4
+build_arch=8.6
+min_glibc=2.38
+# runtime additions to release/v2.5/requirements-pinned.txt (release/swarm-v1.0/requirements-swarm.txt, hash-pinned):
+# FlashInfer 0.7 for the PCIe IPC all-reduce (VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1) and its new dependency.
+flashinfer=0.7.0.post1

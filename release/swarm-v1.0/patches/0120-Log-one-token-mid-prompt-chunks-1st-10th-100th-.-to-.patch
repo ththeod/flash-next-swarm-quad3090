@@ -1,0 +1,61 @@
+From 34c469c59d0dd27bdc57d61006819fd408b15384 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 16:28:52 +0300
+Subject: [PATCH 120/138] Log one-token mid-prompt chunks (1st, 10th, 100th,
+ ...) to measure how often the PP crash trigger occurs
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/worker/gpu/model_runner.py | 28 ++++++++++++++++++++++++----
+ 1 file changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 8116c21..4043bf1 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -190,6 +190,25 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
+ 
+ logger = init_logger(__name__)
+ 
++# One-token mid-prompt chunks seen (they run as prefill rows, see
++# gather_batch_req_state); logged on the 1st, 10th, 100th, ... occurrence.
++_mid_prompt_one_token_chunks = 0
++
++
++def _note_mid_prompt_one_token_chunks(n: int) -> None:
++    global _mid_prompt_one_token_chunks
++    if not n:
++        return
++    before = _mid_prompt_one_token_chunks
++    _mid_prompt_one_token_chunks += n
++    after = _mid_prompt_one_token_chunks
++    if before == 0 or len(str(after)) > len(str(before)):
++        logger.info(
++            "one-token mid-prompt chunk scheduled (%d so far); runs as a "
++            "prefill row",
++            after,
++        )
++
+ 
+ def grammar_invalid_draft_positions(
+     input_batch: InputBatch,
+@@ -1379,11 +1398,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             num_new_tokens = num_scheduled_tokens
+             if num_draft_tokens_np is not None:
+                 num_new_tokens = num_new_tokens - num_draft_tokens_np
+-            one_token_ext = (
+-                (num_new_tokens == 1)
+-                & (num_computed_prefill_tokens_np > 0)
+-                & (num_computed_prefill_tokens_np + 1 >= prefill_len_np)
++            one_token = (num_new_tokens == 1) & (num_computed_prefill_tokens_np > 0)
++            is_tail = num_computed_prefill_tokens_np + 1 >= prefill_len_np
++            _note_mid_prompt_one_token_chunks(
++                int((is_prefilling_np & one_token & ~is_tail).sum())
+             )
++            one_token_ext = one_token & is_tail
+             prefill_runs_as_decode_np = is_prefilling_np & one_token_ext
+             decode_graph_eligible = bool(
+                 (prefill_runs_as_decode_np | ~is_prefilling_np).all()
+-- 
+2.53.0
+

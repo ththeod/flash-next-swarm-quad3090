@@ -1,0 +1,76 @@
+From 03cb11e25764ffdc9e74d0097bdb0edd98f73dcf Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:57:55 +0300
+Subject: [PATCH 107/138] fp4: E4M3 scale encode RNE (bit-exact with torch),
+ E2M1 thresholds compared as |x| > t*scale (exact); unit test passes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/models/qwen4_exp/nvidia/ops/qsa.py | 34 +++++++++++++++----------
+ 1 file changed, 21 insertions(+), 13 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index 52ba062..a5cf51e 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -62,19 +62,26 @@ def _unit_scale(device: torch.device) -> torch.Tensor:
+ 
+ @triton.jit
+ def _encode_e4m3(x):
+-    """fp32 >= 0 -> E4M3 byte, round half up on the dropped mantissa bit,
+-    saturating at 448 (0x7E); never emits the NaN codes 0x7F/0xFF."""
++    """fp32 >= 0 -> E4M3 byte, round to nearest even (bit-exact with
++    torch.float8_e4m3fn on finite inputs <= 448), saturating at 448 (0x7E);
++    never emits the NaN codes 0x7F/0xFF."""
+     x = tl.minimum(tl.maximum(x, 0.0), 448.0)
+     bits = x.to(tl.int32, bitcast=True)
+     exp = ((bits >> 23) & 0xFF) - 127
+     mant = bits & 0x7FFFFF
+-    m = (mant >> 20) + ((mant >> 19) & 1)
++    m = mant >> 20
++    rem = mant & 0xFFFFF
++    m = m + ((rem > 0x80000) | ((rem == 0x80000) & ((m & 1) == 1))).to(tl.int32)
+     exp_n = tl.where(m == 8, exp + 1, exp)
+     m = tl.where(m == 8, 0, m)
+     normal = tl.minimum(((exp_n + 7) << 3) | m, 0x7E)
+     # Below 2^-6 E4M3 is subnormal: multiples of 2^-9 (8 rounds to the first
+-    # normal, code 0x08 = 2^-6, by construction).
+-    sub = tl.floor(x * 512.0 + 0.5).to(tl.int32)
++    # normal, code 0x08 = 2^-6, by construction). x * 512 is exact.
++    f = x * 512.0
++    fl = tl.floor(f)
++    frac = f - fl
++    sub = fl.to(tl.int32)
++    sub = sub + ((frac > 0.5) | ((frac == 0.5) & ((sub & 1) == 1))).to(tl.int32)
+     return tl.where(exp < -6, sub, normal).to(tl.uint8)
+ 
+ 
+@@ -95,16 +102,17 @@ def _fp4_quantize_row(x, HEAD_DIM: tl.constexpr):
+     amax = tl.max(tl.abs(g), axis=1)
+     scale_code = _encode_e4m3(amax / 6.0)
+     scale = _decode_e4m3_to_bf16(scale_code).to(tl.float32)
+-    scale = tl.where(scale > 0.0, scale, 1.0)
+-    v = g / scale[:, None]
+-    a = tl.abs(v)
+-    # Nearest E2M1 magnitude (midpoints; ties go down, like the fake-quant test).
++    scale = tl.where(scale > 0.0, scale, 1.0)[:, None]
++    a = tl.abs(g)
++    # Nearest E2M1 magnitude of |x| / scale (midpoints; ties go down), compared
++    # as |x| > t * scale: exact in fp32 (E4M3 scale x these t), no division.
+     code = (
+-        (a > 0.25).to(tl.int32) + (a > 0.75).to(tl.int32) + (a > 1.25).to(tl.int32)
+-        + (a > 1.75).to(tl.int32) + (a > 2.5).to(tl.int32) + (a > 3.5).to(tl.int32)
+-        + (a > 5.0).to(tl.int32)
++        (a > 0.25 * scale).to(tl.int32) + (a > 0.75 * scale).to(tl.int32)
++        + (a > 1.25 * scale).to(tl.int32) + (a > 1.75 * scale).to(tl.int32)
++        + (a > 2.5 * scale).to(tl.int32) + (a > 3.5 * scale).to(tl.int32)
++        + (a > 5.0 * scale).to(tl.int32)
+     )
+-    nib = code | (((v < 0.0) & (code > 0)).to(tl.int32) << 3)
++    nib = code | (((g < 0.0) & (code > 0)).to(tl.int32) << 3)
+     lo, hi = tl.split(tl.reshape(nib, (HEAD_DIM // 2, 2)))
+     return (lo | (hi << 4)).to(tl.uint8), scale_code
+ 
+-- 
+2.53.0
+

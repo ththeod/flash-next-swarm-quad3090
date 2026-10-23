@@ -1,0 +1,35 @@
+From 51d49d36bc6036ec7f88329f00f6ae46093757b2 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 18:54:52 +0300
+Subject: [PATCH 103/138] exp: e2-guard knows DFlashSpeculator's
+ query_cudagraph_manager (expects FULL_DECODE_ONLY)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/v1/e2_guards.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/vllm/v1/e2_guards.py b/vllm/v1/e2_guards.py
+index 947dada..1dafb1b 100644
+--- a/vllm/v1/e2_guards.py
++++ b/vllm/v1/e2_guards.py
+@@ -298,11 +298,16 @@ EXPECTED_RESOLVED_MODES = {
+     "draft.prefill_cudagraph_manager": REQUIRED_CUDAGRAPH_MODE_NAME,
+     "draft.decode_cudagraph_manager": "FULL_DECODE_ONLY",
+     "draft.cudagraph_manager": "FULL_DECODE_ONLY",
++    # local (DFlash 2 experiment): DFlashSpeculator keeps one query manager,
++    # FULL_DECODE_ONLY by design ("PIECEWISE cudagraphs are not supported for
++    # dflash"); NONE would mean an eager drafter and is rejected like the rest.
++    "draft.query_cudagraph_manager": "FULL_DECODE_ONLY",
+ }
+ _DRAFT_MANAGER_ATTRS = (
+     "prefill_cudagraph_manager",
+     "decode_cudagraph_manager",
+     "cudagraph_manager",
++    "query_cudagraph_manager",
+ )
+ 
+ 
+-- 
+2.53.0
+

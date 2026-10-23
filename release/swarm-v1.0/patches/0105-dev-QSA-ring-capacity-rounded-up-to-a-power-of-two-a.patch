@@ -1,0 +1,30 @@
+From f3af113d6fd9125f6ced2684f7743de69660ece8 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:24:12 +0300
+Subject: [PATCH 105/138] dev: QSA ring capacity rounded up to a power of two
+ (any draft count divides the 4096 block; 7 drafts -> 16 rows)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/models/qwen4_exp/common/qsa_cache.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/vllm/models/qwen4_exp/common/qsa_cache.py b/vllm/models/qwen4_exp/common/qsa_cache.py
+index fbc517f..5323800 100644
+--- a/vllm/models/qwen4_exp/common/qsa_cache.py
++++ b/vllm/models/qwen4_exp/common/qsa_cache.py
+@@ -899,6 +899,11 @@ class QSAKeyStateCache(_QSAStateCache):
+         # overwrite a committed key the next step needs to close the group.
+         span = self.compress_ratio + vllm_config.num_speculative_tokens
+         capacity = self.compress_ratio * cdiv(span, self.compress_ratio)
++        # local (wider verify): round up to a power of two so the ring still
++        # divides the power-of-two attention block for any draft count (7
++        # drafts: 12 -> 16 rows). Unchanged for 3 drafts (8). A larger ring only
++        # keeps more committed rows; the tag check still validates every read.
++        capacity = 1 << (capacity - 1).bit_length()
+         assert self.cache_config.block_size % capacity == 0, (
+             f"QSA ring capacity {capacity} must divide the attention block "
+             f"size {self.cache_config.block_size}"
+-- 
+2.53.0
+

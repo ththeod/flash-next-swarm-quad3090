@@ -1,0 +1,16 @@
+# /etc/default/gpu-power (read by gpu-power.service). See docs/swarm/power-and-clocks.md.
+#
+# Stock (locked) cards: halt95's reference settings, a 220 W cap on every card and no clock lock.
+GPU_POWER_LIMIT=220
+GPU_MAX_CLOCK=0
+#
+# Cards unlocked with gpu-unlock (docs/swarm/gpu-unlock.md): 240 W on every card and a 1400 MHz clock lock. The lock,
+# not the cap, limits the millisecond power spikes that trip a PSU's over-current protection; with unlocked cards our
+# 1500 W PSU tripped at 1455 and 1650 MHz, and 1400 held for days. Use these two lines instead of the two above:
+#GPU_POWER_LIMIT=240
+#GPU_MAX_CLOCK=1400
+#
+# Optional per-GPU caps (PCI bus id = watts) for boards that need more, e.g. 390 W-class cards with higher idle draw.
+# Our measured runs used 265 / 255 / 255 / 240 W, tuned to this machine's boards. Bus ids:
+#   nvidia-smi --query-gpu=pci.bus_id --format=csv
+#GPU_POWER_LIMITS="00000000:01:00.0=265 00000000:02:00.0=255 00000000:2D:00.0=255 00000000:41:00.0=240"

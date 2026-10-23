@@ -1,0 +1,226 @@
+From cb3e5169780aac1e7f41895b0a107b9626d6af00 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:22:13 +0300
+Subject: [PATCH 104/138] dev: VLLM_EXP_SW_BLOCK_SIZE / VLLM_EXP_SW_SCRATCH
+ (drafter window cache page + prefix-cache opt-out) and VLLM_EXP_SEG_TOKENIZE
+ (segmented cached prompt tokenization, exact)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../layers/attention/attention.py             |  19 ++-
+ vllm/renderers/base.py                        | 117 ++++++++++++++++++
+ vllm/v1/kv_cache_interface.py                 |  15 +++
+ 3 files changed, 150 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/model_executor/layers/attention/attention.py b/vllm/model_executor/layers/attention/attention.py
+index a001c8c..4c3ae2e 100644
+--- a/vllm/model_executor/layers/attention/attention.py
++++ b/vllm/model_executor/layers/attention/attention.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
+ from typing import TYPE_CHECKING, Any, cast
+ 
+ import torch
+@@ -45,10 +46,21 @@ from vllm.v1.attention.selector import get_attn_backend
+ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
+     KVCacheSpec,
++    ScratchSlidingWindowSpec,
+     SlidingWindowSpec,
+     get_kv_quant_mode,
+ )
+ 
++# local (DFlash 2 experiment) knobs for sliding-window layers (Qwen4Exp has none
++# of its own, so on Flash-Next these only reach the DFlash drafter's layers):
++#   VLLM_EXP_SW_BLOCK_SIZE=N  use N-token blocks, e.g. 1024 so a BF16 drafter page
++#                             (2 KiB/token/layer) equals the FP8 QSA page (512 B x
++#                             4096) instead of inflating every pool block 4x
++#   VLLM_EXP_SW_SCRATCH=1     keep the group out of prefix caching
++#                             (ScratchSlidingWindowSpec)
++_EXP_SW_BLOCK_SIZE = int(os.environ.get("VLLM_EXP_SW_BLOCK_SIZE", "0") or 0)
++_EXP_SW_SCRATCH = os.environ.get("VLLM_EXP_SW_SCRATCH", "0") == "1"
++
+ if TYPE_CHECKING:
+     from vllm.model_executor.layers.attention import MLAAttention
+ 
+@@ -649,7 +661,12 @@ class Attention(nn.Module, AttentionLayerBase):
+             sw_block_size = _largest_kernel_block_within(
+                 self.attn_backend, sw_per_token, page_budget, block_size
+             )
+-            return SlidingWindowSpec(
++            if _EXP_SW_BLOCK_SIZE and shared_page is None:
++                sw_block_size = _EXP_SW_BLOCK_SIZE
++            sw_spec_cls = (
++                ScratchSlidingWindowSpec if _EXP_SW_SCRATCH else SlidingWindowSpec
++            )
++            return sw_spec_cls(
+                 block_size=sw_block_size,
+                 num_kv_heads=self.num_kv_heads,
+                 head_size=self.head_size,
+diff --git a/vllm/renderers/base.py b/vllm/renderers/base.py
+index 4aca17f..ae85151 100644
+--- a/vllm/renderers/base.py
++++ b/vllm/renderers/base.py
+@@ -68,6 +68,111 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++# --- local: segmented, cached prompt tokenization (deepseek-recipe idea) -------
++# VLLM_EXP_SEG_TOKENIZE=1: long chat prompts are split before each
++# "<|im_start|>" (a special token, so the tokenizer never merges across it and
++# per-segment encoding is exact), only segments not seen before are encoded,
++# in one parallel encode_batch, and segment ids are kept in an LRU bounded by
++# VLLM_EXP_SEG_TOKENIZE_TOKENS (default 8M tokens). Agent turns resend the same
++# earlier messages, so most of a 100K+ token prompt is a cache hit.
++# VLLM_EXP_SEG_TOKENIZE_VERIFY=1 also runs the normal path and logs/uses it on
++# any mismatch (for testing).
++import collections as _collections
++import os as _os
++import threading as _threading
++
++import numpy as _np
++
++_SEG_TOKENIZE = _os.environ.get("VLLM_EXP_SEG_TOKENIZE", "0") == "1"
++_SEG_VERIFY = _os.environ.get("VLLM_EXP_SEG_TOKENIZE_VERIFY", "0") == "1"
++_SEG_BUDGET = int(_os.environ.get("VLLM_EXP_SEG_TOKENIZE_TOKENS", str(8 << 20)))
++_SEG_MIN_CHARS = 16384
++_SEG_SEP = "<|im_start|>"
++
++
++class _SegmentTokenCache:
++    def __init__(self, budget_tokens: int) -> None:
++        self.budget = budget_tokens
++        self.tokens = 0
++        self.items: _collections.OrderedDict[str, _np.ndarray] = (
++            _collections.OrderedDict()
++        )
++        self.lock = _threading.Lock()
++        self.hits = self.misses = 0
++
++    def get_many(self, segs: list[str]) -> list[_np.ndarray | None]:
++        out: list[_np.ndarray | None] = []
++        with self.lock:
++            for s in segs:
++                ids = self.items.get(s)
++                if ids is not None:
++                    self.items.move_to_end(s)
++                    self.hits += 1
++                else:
++                    self.misses += 1
++                out.append(ids)
++        return out
++
++    def put_many(self, segs: list[str], ids: list[_np.ndarray]) -> None:
++        with self.lock:
++            for s, a in zip(segs, ids):
++                if s in self.items:
++                    continue
++                self.items[s] = a
++                self.tokens += len(a)
++            while self.tokens > self.budget and self.items:
++                _, old = self.items.popitem(last=False)
++                self.tokens -= len(old)
++
++
++_seg_cache = _SegmentTokenCache(_SEG_BUDGET)
++
++
++def _segmented_encode(tokenizer: Any, text: str, kwargs: dict[str, Any]) -> list[int] | None:
++    """Exact token ids for ``tokenizer(text, **kwargs)`` via cached segments, or
++    None when this prompt/tokenizer is not eligible (caller falls back)."""
++    if len(text) < _SEG_MIN_CHARS or _SEG_SEP not in text:
++        return None
++    if set(kwargs) - {"truncation", "max_length", "add_special_tokens"}:
++        return None
++    state = getattr(tokenizer, "_exp_seg_state", None)
++    if state is None:
++        backend = getattr(tokenizer, "backend_tokenizer", None) or getattr(
++            tokenizer, "_tokenizer", None
++        )
++        ok = backend is not None and hasattr(backend, "encode_batch")
++        if ok:
++            # Eligible only if the separator is one special token and special
++            # tokens add nothing (no BOS/EOS), so concatenation is exact.
++            sep_ids = tokenizer(_SEG_SEP, add_special_tokens=False)["input_ids"]
++            ok = len(sep_ids) == 1 and tokenizer("a", add_special_tokens=True)[
++                "input_ids"
++            ] == tokenizer("a", add_special_tokens=False)["input_ids"]
++        state = backend if ok else False
++        try:
++            tokenizer._exp_seg_state = state
++        except Exception:
++            pass
++        logger.info("segmented prompt tokenization %s", "on" if ok else "not eligible")
++    if state is False:
++        return None
++    parts = text.split(_SEG_SEP)
++    segs = ([parts[0]] if parts[0] else []) + [_SEG_SEP + p for p in parts[1:]]
++    cached = _seg_cache.get_many(segs)
++    missing = [s for s, c in zip(segs, cached) if c is None]
++    if missing:
++        enc = state.encode_batch(missing, add_special_tokens=False)
++        new = [_np.asarray(e.ids, dtype=_np.int32) for e in enc]
++        _seg_cache.put_many(missing, new)
++        fresh = dict(zip(missing, new))
++        cached = [c if c is not None else fresh[s] for s, c in zip(segs, cached)]
++    ids = _np.concatenate(cached).tolist()
++    if kwargs.get("truncation") and kwargs.get("max_length") is not None:
++        ids = ids[: kwargs["max_length"]]
++    return ids
++# ------------------------------------------------------------------------------
++
++
+ _T = TypeVar("_T", bound=TokenizerLike, default=TokenizerLike)
+ 
+ 
+@@ -587,6 +692,18 @@ class BaseRenderer(ABC, Generic[_T]):
+         tokenizer = self.get_tokenizer()
+         want_offsets = self._wants_offsets(prompt, params)
+         kwargs = params.get_encode_kwargs()
++        if _SEG_TOKENIZE and not want_offsets:
++            ids = _segmented_encode(tokenizer, prompt["prompt"], kwargs)
++            if ids is not None:
++                if _SEG_VERIFY:
++                    ref = tokenizer(prompt["prompt"], **kwargs)["input_ids"]
++                    if list(ref) != ids:
++                        logger.warning(
++                            "segmented tokenization MISMATCH (%d vs %d tokens); "
++                            "using the reference", len(ids), len(ref)
++                        )
++                        ids = list(ref)
++                return self._build_tokens_prompt(ids, prompt, offset_mapping=None)
+         if want_offsets:
+             kwargs = {**kwargs, "return_offsets_mapping": True}
+         encoding = tokenizer(prompt["prompt"], **kwargs)
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 8931b95..d806768 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -861,6 +861,21 @@ class SlidingWindowSpec(AttentionSpec):
+         )
+ 
+ 
++@dataclass(frozen=True, kw_only=True)
++class ScratchSlidingWindowSpec(SlidingWindowSpec):
++    """local (DFlash 2 experiment): a sliding-window group kept out of prefix
++    caching, so its coarse blocks do not force block-aligned hits on every
++    group (the coordinator skips non-cacheable groups in hit lookup and in the
++    fine-grained-hit check). Used for a drafter's window cache: after a prefix
++    hit the window over the cached part starts zeroed (needs_kv_cache_zeroing)
++    and only the tokens computed in this request are attended -- drafting stays
++    lossless, only acceptance can change."""
++
++    @property
++    def prefix_cacheable(self) -> bool:
++        return False
++
++
+ @dataclass(frozen=True, kw_only=True)
+ class CircularBufferSpec(AttentionSpec):
+     """One block per request holding the raw keys of the token group that
+-- 
+2.53.0
+

@@ -1,0 +1,5 @@
+# Installed on top of release/v2.5/requirements-pinned.txt by scripts/build-swarm.sh (pip --require-hashes).
+# FlashInfer 0.7 provides the PCIe IPC all-reduce workspace; nccl-extensions is its new dependency (its own
+# dependencies, cuda-core, cuda-pathfinder, nccl4py and numpy, are already in the v2.5 pins).
+flashinfer-python==0.7.0.post1 --hash=sha256:c7adf826568d61fc1b7d3aadd4cae387a35a138bfc08e2deca2f34ecfa280716
+nccl-extensions==0.1.0 --hash=sha256:3328dc1cfeed0ddf37caac00be8c49b3e4f727dce0e7980f8831696165619a4f

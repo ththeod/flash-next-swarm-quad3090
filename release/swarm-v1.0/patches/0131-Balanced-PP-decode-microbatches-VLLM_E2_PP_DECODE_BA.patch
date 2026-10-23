@@ -1,0 +1,224 @@
+From bca8af76dbe15829825ab008b8afd8166323f8c8 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 19:17:25 +0300
+Subject: [PATCH 131/138] Balanced PP decode microbatches
+ (VLLM_E2_PP_DECODE_BALANCE)
+
+V2 runner + PP + async scheduling: a request decodes every pp_size steps
+(next_decode_eligible_step), so the decoding requests form pp_size
+microbatches that keep the split admission gave them (6/2 and 7/1 with 8
+requests in W37/W38 profiles). Each step's chain through both stages is
+paced by the biggest microbatch. With the switch on, a step schedules at
+most ceil(decoding / pp_size) decodes; a request over the cap is eligible
+again next step, which evens the split out within one cycle.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/test_envs.py                    |  3 ++
+ tests/v1/core/test_scheduler.py       | 44 +++++++++++++++++++++++++++
+ vllm/envs.py                          | 12 ++++++++
+ vllm/v1/core/sched/async_scheduler.py |  2 ++
+ vllm/v1/core/sched/scheduler.py       | 36 ++++++++++++++++++++++
+ 5 files changed, 97 insertions(+)
+
+diff --git a/tests/test_envs.py b/tests/test_envs.py
+index 90518ff..258e847 100644
+--- a/tests/test_envs.py
++++ b/tests/test_envs.py
+@@ -660,6 +660,8 @@ _FORK_IGNORED = [
+     ("VLLM_E2_MAMBA_RETAIN_CHECKPOINT", "0", False),
+     # Adaptive retention hold-off (local 2026-10-22): scheduler-side, 0 = off.
+     ("VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S", "45", 45.0),
++    # Balanced PP decode microbatches (local 2026-10-22): scheduler-side, default off.
++    ("VLLM_E2_PP_DECODE_BALANCE", "1", True),
+     # Profiling-teardown leak policy: fails the boot unless "0"/"false"/"no".
+     ("VLLM_FAIL_ON_PROFILING_KV_LEAK", "no", False),
+     # Medium-path counter reader: a host-side log cadence, and the older slot-count
+@@ -1077,6 +1079,7 @@ _MUST_BE_READ = {
+     "VLLM_E2_MAMBA_SLOT_OWNERSHIP": "vllm/v1/worker/mamba_utils.py",
+     "VLLM_E2_MAMBA_RETAIN_CHECKPOINT": "vllm/v1/core/single_type_kv_cache_manager.py",
+     "VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S": "vllm/v1/core/sched/scheduler.py",
++    "VLLM_E2_PP_DECODE_BALANCE": "vllm/v1/core/sched/scheduler.py",
+     "VLLM_E2_SIDE_CACHE_LAYOUT": "vllm/v1/core/kv_cache_utils.py",
+     "VLLM_E2_SIDE_CACHE_OFFLOAD": "vllm/v1/core/kv_cache_utils.py",
+     "VLLM_FAIL_ON_PROFILING_KV_LEAK": "vllm/v1/worker/gpu/cudagraph_utils.py",
+diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
+index 71e8554..1658671 100644
+--- a/tests/v1/core/test_scheduler.py
++++ b/tests/v1/core/test_scheduler.py
+@@ -6712,3 +6712,47 @@ def test_update_draft_token_ids_in_output_strips_padding():
+         -1,
+     ]
+     assert scheduler_output.num_invalid_spec_tokens == {request.request_id: 2}
++
++
++def _pretend_gpus(monkeypatch, n: int) -> None:
++    """PP configs validate the world size against the visible GPUs; these
++    scheduler-only tests never touch a device."""
++    from vllm.platforms import current_platform
++
++    monkeypatch.setattr(current_platform, "device_count", lambda: n)
++
++
++def _pp2_decode_split(monkeypatch, balance: str) -> list[int]:
++    """Admit 8 requests as 6 + 2 under V2 + PP2 + async scheduling and return
++    the number of decodes scheduled in each of the next 8 steps."""
++    monkeypatch.setenv("VLLM_E2_PP_DECODE_BALANCE", balance)
++    _pretend_gpus(monkeypatch, 2)
++    scheduler = create_scheduler(
++        async_scheduling=True, pipeline_parallel_size=2, use_v2_model_runner=True
++    )
++    requests = create_requests(num_requests=8, num_tokens=8, max_tokens=64)
++    for request in requests[:6]:
++        scheduler.add_request(request)
++    scheduler.schedule()  # 6 whole-prompt prefills
++    for request in requests[6:]:
++        scheduler.add_request(request)
++    scheduler.schedule()  # 2 whole-prompt prefills
++    return [len(scheduler.schedule().num_scheduled_tokens) for _ in range(8)]
++
++
++def test_pp_decode_balance_evens_out_microbatches(monkeypatch):
++    """Decodes alternate between pp_size steps and keep the split admission
++    gave them; VLLM_E2_PP_DECODE_BALANCE caps a step at ceil(decoding /
++    pp_size), so the 6/2 split becomes 4/4 within one cycle."""
++    assert _pp2_decode_split(monkeypatch, "0") == [6, 2] * 4
++    split = _pp2_decode_split(monkeypatch, "1")
++    assert split[0] == 4 and split[2:] == [4] * 6, split
++    assert sum(split[:2]) == 8, split  # nobody is dropped in the switch-over
++
++
++def test_pp_decode_balance_is_off_without_the_decode_cadence(monkeypatch):
++    """Synchronous scheduling has no decode cadence: the cap never applies."""
++    monkeypatch.setenv("VLLM_E2_PP_DECODE_BALANCE", "1")
++    _pretend_gpus(monkeypatch, 2)
++    scheduler = create_scheduler(pipeline_parallel_size=2, use_v2_model_runner=True)
++    assert not scheduler._pp_decode_balance
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 76453f8..ca517e0 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -464,6 +464,13 @@ if TYPE_CHECKING:
+     # again only after this many seconds without such a failure. 0 = static
+     # retention (the v2.5 behaviour). Scheduler-side only. AOT: no. CAPTURE: no.
+     VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S: float = 0.0
++    # (local 2026-10-22) V2 + PP + async: cap the decodes scheduled in one step at
++    # ceil(decoding requests / pp_size), deferring the rest by one step, so the
++    # pp_size decode microbatches stay balanced instead of keeping whatever split
++    # admission produced (6/2 and 7/1 seen with 8 requests; each step's chain
++    # through both stages is paced by the biggest microbatch). Scheduler-side
++    # only. AOT: no. CAPTURE: no.
++    VLLM_E2_PP_DECODE_BALANCE: bool = False
+     # v2.5 side-cache layout (Flash-Next PLE + QSA ring): stop charging each
+     # tiny side cache a whole packed pool block per request. The TP-replicated
+     # PLE short-conv state group is folded into a GDN group that has a spare
+@@ -2672,6 +2679,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S": lambda: _e2_nonneg_seconds(
+         "VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S"
+     ),
++    # Balanced PP decode microbatches (local; default off). Strict "0"/"1"; read by the scheduler.
++    "VLLM_E2_PP_DECODE_BALANCE": lambda: _e2_strict_switch(
++        "VLLM_E2_PP_DECODE_BALANCE", default=False
++    ),
+     # Side-cache layout (v2.5; PLE state folded into a GDN group + QSA ring slot
+     # packing), default ON. Strict "0"/"1"; read once per get_kv_cache_configs call.
+     "VLLM_E2_SIDE_CACHE_LAYOUT": lambda: _e2_strict_switch(
+@@ -2957,6 +2968,7 @@ def compile_factors() -> dict[str, object]:
+         # A/B flip must reuse the same AOT cache.
+         "VLLM_E2_MAMBA_RETAIN_CHECKPOINT",
+         "VLLM_E2_MAMBA_RETAIN_ADAPTIVE_S",
++        "VLLM_E2_PP_DECODE_BALANCE",
+         # Boot-failure policy of a host-side profiling-teardown check; read by no
+         # compiled code.
+         "VLLM_FAIL_ON_PROFILING_KV_LEAK",
+diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
+index 56a532b..e4e668a 100644
+--- a/vllm/v1/core/sched/async_scheduler.py
++++ b/vllm/v1/core/sched/async_scheduler.py
+@@ -10,6 +10,8 @@ logger = init_logger(__name__)
+ 
+ 
+ class AsyncScheduler(Scheduler):
++    _decode_cadence = True
++
+     def __init__(self, *args, **kwargs) -> None:
+         super().__init__(*args, **kwargs)
+         # reusable read-only placeholder list for speculative decoding.
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 1461017..9a0b7bd 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -87,6 +87,10 @@ _ZERO_OWNERSHIP_CHECK = os.getenv("VLLM_E2_ZERO_OWNERSHIP_CHECK") == "1"
+ 
+ 
+ class Scheduler(SchedulerInterface):
++    # True on schedulers that pace decodes with `next_decode_eligible_step`
++    # (AsyncScheduler).
++    _decode_cadence = False
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -367,6 +371,15 @@ class Scheduler(SchedulerInterface):
+ 
+         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+         self.use_v2_model_runner = vllm_config.use_v2_model_runner
++        # Balanced PP decode microbatches (VLLM_E2_PP_DECODE_BALANCE). Only
++        # meaningful with the AsyncScheduler's decode cadence
++        # (`next_decode_eligible_step`, V2 runner + PP).
++        self._pp_decode_balance = (
++            envs.VLLM_E2_PP_DECODE_BALANCE
++            and self._decode_cadence
++            and self.use_v2_model_runner
++            and self.parallel_config.pipeline_parallel_size > 1
++        )
+         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+         # cadence (`next_decode_eligible_step`).
+         self.current_step = 0
+@@ -742,6 +755,19 @@ class Scheduler(SchedulerInterface):
+             throttle_prefills and not self.prefill_capacity_bound
+         ) and any(not r.is_prefill_chunk for r in self.running)
+ 
++        # Balanced PP decode microbatches: a request decodes every pp_size
++        # steps, so the decoding requests form pp_size microbatches that keep
++        # whatever split admission gave them (6/2 and 7/1 with 8 requests), and
++        # every step's chain through all stages is paced by the biggest one.
++        # Cap this step's decodes at ceil(decoding / pp_size); a request over
++        # the cap is eligible again next step, which evens the split out.
++        decode_cap = None
++        num_decodes_scheduled = 0
++        if self._pp_decode_balance:
++            num_decoding = sum(1 for r in self.running if not r.is_prefill_chunk)
++            pp_size = self.parallel_config.pipeline_parallel_size
++            decode_cap = (num_decoding + pp_size - 1) // pp_size
++
+         # First, schedule the RUNNING requests.
+         req_index = 0
+         while req_index < len(self.running) and token_budget > 0:
+@@ -771,6 +797,15 @@ class Scheduler(SchedulerInterface):
+                 req_index += 1
+                 continue
+ 
++            if (
++                decode_cap is not None
++                and not request.is_prefill_chunk
++                and num_decodes_scheduled >= decode_cap
++            ):
++                # Over this step's share of decodes: decode next step instead.
++                req_index += 1
++                continue
++
+             if defer_prefills and request.is_prefill_chunk:
+                 # DP prefill balancing: defer this in-progress prefill chunk to a
+                 # cadence-aligned step; decodes still run to fill this step.
+@@ -954,6 +989,7 @@ class Scheduler(SchedulerInterface):
+             # Schedule the request.
+             scheduled_running_reqs.append(request)
+             prefill_scheduled |= request.is_prefill_chunk
++            num_decodes_scheduled += not request.is_prefill_chunk
+             request_id = request.request_id
+             req_to_new_blocks[request_id] = new_blocks
+             num_scheduled_tokens[request_id] = num_new_tokens
+-- 
+2.53.0
+

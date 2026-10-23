@@ -1,0 +1,169 @@
+From 4f94a65ecec75c5220f40e6754ff625757695d95 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 04:28:01 +0300
+Subject: [PATCH 138/138] RecoverSSM GDN commit: store the align boundary state
+ and the final state in one traversal (Merlin 3.0.0 fix)
+
+The V2 pre-copy puts the source state in the block of the scheduled window's
+end, so for an accepted window that crosses a block boundary final == src. The
+two-launch commit wrote the final state first and the boundary launch then
+refolded the boundary tokens on top of it: a wrong boundary-block state (final
+state always correct). Not reachable with our config (retention interval 0,
+prompt-only state keys and RAM tier), fixed for hygiene; one launch fewer.
+Ported from halt95/merlin-engine merlin-v3.0.0 (ad42e37). Adds
+test_align_boundary_with_v2_precopy_source.
+
+Co-authored-by: halt95 <halt95@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/kernels/mamba/test_recoverssm_gdn.py    | 31 +++++++++
+ .../layers/mamba/gdn/recoverssm_gdn.py        | 67 +++++++++++--------
+ 2 files changed, 71 insertions(+), 27 deletions(-)
+
+diff --git a/tests/kernels/mamba/test_recoverssm_gdn.py b/tests/kernels/mamba/test_recoverssm_gdn.py
+index 59ddb7f..8d7a26f 100644
+--- a/tests/kernels/mamba/test_recoverssm_gdn.py
++++ b/tests/kernels/mamba/test_recoverssm_gdn.py
+@@ -347,6 +347,37 @@ def test_align_boundary_and_final_state_match_native(nc, accepted, bs):
+     assert torch.equal(ckpt[final_blk], states[accepted - 1])
+ 
+ 
++@pytest.mark.parametrize("nc,accepted,bs", ALIGN_CASES)
++def test_align_boundary_with_v2_precopy_source(nc, accepted, bs):
++    """V2 runner placement: the align pre-copy moves the checkpoint into the block
++    of the scheduled window's last token (seq_len - 1), so a window whose accepted
++    tokens cross a boundary commits its final state into its own source block and
++    its boundary state into the block before. The boundary state must still be
++    folded from the source (start) state, not from the just-stored final state."""
++    inp = _make([T], nb=12)
++    bt = torch.arange(2, 8, dtype=torch.int32, device="cuda").reshape(1, 6)
++    src = bt[0, (nc + T - 1) // bs].reshape(1).contiguous()
++    inp["state_indices"] = src
++    _verify(inp)
++    _, states = _native(inp)
++    ckpt = inp["checkpoint_state"].clone()
++    ctx = _context(inp, ckpt)
++    ctx.commit(
++        torch.tensor([accepted], dtype=torch.int32, device="cuda"),
++        src,
++        inp["query_start_loc"],
++        block_table=bt,
++        num_computed_tokens=torch.tensor([nc], dtype=torch.int32, device="cuda"),
++        mamba_block_size=bs,
++    )
++    next_boundary = (nc // bs + 1) * bs
++    final_blk = int(bt[0, max(nc + accepted - 1, 0) // bs])
++    if nc + accepted >= next_boundary:
++        boundary_blk = int(bt[0, next_boundary // bs - 1])
++        assert torch.equal(ckpt[boundary_blk], states[next_boundary - nc - 1])
++    assert torch.equal(ckpt[final_blk], states[accepted - 1])
++
++
+ @pytest.mark.parametrize("gate", list(GATES))
+ @pytest.mark.parametrize("seed", [0, 1, 2])
+ def test_commit_matches_native_under_extreme_gates(gate, seed):
+diff --git a/vllm/model_executor/layers/mamba/gdn/recoverssm_gdn.py b/vllm/model_executor/layers/mamba/gdn/recoverssm_gdn.py
+index 8adc094..9f6f69e 100644
+--- a/vllm/model_executor/layers/mamba/gdn/recoverssm_gdn.py
++++ b/vllm/model_executor/layers/mamba/gdn/recoverssm_gdn.py
+@@ -353,12 +353,17 @@ def _commit_gdn_state_kernel(
+     BK: tl.constexpr,
+     BV: tl.constexpr,
+     NUM_HEADS: tl.constexpr,
+-    BOUNDARY: tl.constexpr,
++    ALIGN_MODE: tl.constexpr,
+ ):
+-    # Every program runs one fold and keeps one tile live. In align mode the
+-    # block-boundary state (the window's first boundary_len tokens) is folded by a
+-    # second launch (BOUNDARY): a crossing window's boundary state goes into its
+-    # source block, which the first launch's final-state fold must still read.
++    # Every program folds one tile of one row for one layer in a single traversal:
++    # S0 is loaded once into registers, the block-boundary state (align mode, after
++    # boundary_recovery_len tokens) is stored from the registers when the fold
++    # reaches it, and the final state after commit_len tokens. Either destination
++    # may alias the source block: the V2 align pre-copy puts the checkpoint in the
++    # block of the scheduled window's end, so final == src with a distinct boundary
++    # block is the common crossing case (the old final-then-boundary launches
++    # re-read src after the final store and folded the boundary state on top of
++    # the final state). Nothing reloads the source after a store.
+     pid_v = tl.program_id(0)
+     pid_b = tl.program_id(1)
+     pid_lh = tl.program_id(2)
+@@ -373,14 +378,15 @@ def _commit_gdn_state_kernel(
+     final_idx = tl.load(final_state_indices_ptr + pid_b).to(tl.int64)
+     if final_idx <= null_block_id:
+         return
+-    dst_idx = final_idx
+-    if BOUNDARY:
+-        dst_idx = tl.load(boundary_state_indices_ptr + pid_b).to(tl.int64)
++    boundary_len = 0
++    boundary_idx = final_idx
++    if ALIGN_MODE:
++        boundary_idx = tl.load(boundary_state_indices_ptr + pid_b).to(tl.int64)
++        boundary_len = tl.load(boundary_recovery_lens_ptr + pid_b)
+         # A window ending exactly on the boundary keeps its final state in that
+-        # block: the first launch already wrote it (and may have overwritten src).
+-        if dst_idx <= null_block_id or dst_idx == final_idx:
+-            return
+-        n = tl.load(boundary_recovery_lens_ptr + pid_b)
++        # block (boundary == final): the final store covers it.
++        if boundary_idx <= null_block_id or boundary_idx == final_idx:
++            boundary_len = 0
+     state_ptr = tl.load(state_base_addrs_ptr + pid_l).to(
+         tl.pointer_type(state_ref_ptr.dtype.element_ty)
+     )
+@@ -411,8 +417,16 @@ def _commit_gdn_state_kernel(
+         kk = tl.load(rec + (V + offs_k) * stride_replay_dim, mask=mask_k, other=0.0)
+         decay = tl.load(rec + (V + K) * stride_replay_dim)
+         h = tl.fma(c[:, None], kk[None, :], h * decay)
++        if ALIGN_MODE:
++            # boundary_len <= n whenever the plan set a boundary (the window
++            # crossed); 0 (no boundary, or boundary == final) never matches.
++            tl.store(
++                state_ptr + boundary_idx * sbs + pid_h * stride_state_head + sp,
++                h.to(state_ref_ptr.dtype.element_ty),
++                mask=mask_state & (t + 1 == boundary_len),
++            )
+     tl.store(
+-        state_ptr + dst_idx * sbs + pid_h * stride_state_head + sp,
++        state_ptr + final_idx * sbs + pid_h * stride_state_head + sp,
+         h.to(state_ref_ptr.dtype.element_ty),
+         mask=mask_state,
+     )
+@@ -682,20 +696,19 @@ class GDNRecoverSSMCommitContext:
+             state_indices.stride(0),
+         )
+         grid = (triton.cdiv(V, BV), batch, num_layers * HV)
+-        # Final states first: a boundary state can land in the window's source
+-        # slot, which the final-state fold reads (stream order separates them).
+-        for boundary in (False, True) if align else (False,):
+-            _commit_gdn_state_kernel[grid](
+-                *args,
+-                K=K,
+-                V=V,
+-                BK=BK,
+-                BV=BV,
+-                NUM_HEADS=HV,
+-                BOUNDARY=boundary,
+-                num_warps=4,
+-                num_stages=2,
+-            )
++        # One launch folds each tile once and stores the boundary state (align)
++        # and the final state from registers, so either may alias the source.
++        _commit_gdn_state_kernel[grid](
++            *args,
++            K=K,
++            V=V,
++            BK=BK,
++            BV=BV,
++            NUM_HEADS=HV,
++            ALIGN_MODE=align,
++            num_warps=4,
++            num_stages=2,
++        )
+ 
+ 
+ __all__ = ["GDNRecoverSSMCommitContext", "gdn_recoverssm_verify"]
+-- 
+2.53.0
+

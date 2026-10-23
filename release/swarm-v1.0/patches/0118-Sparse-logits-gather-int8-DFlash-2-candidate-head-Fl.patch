@@ -1,0 +1,458 @@
+From 1f33ade034ab7ff5d4c5c64e0f80f4297c9b0920 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 14:01:34 +0300
+Subject: [PATCH 118/138] Sparse logits gather, int8 DFlash 2 candidate head,
+ FlashInfer top-k-first sampler (all opt-in)
+
+- VLLM_EXP_SPARSE_LOGITS=1: when every scheduled request has top_k <= 64, no
+  logprobs, no penalties / logit bias / bad words / thinking budget, and no
+  grammar, the target's logits are gathered as each TP shard's top-64
+  (FlashInfer radix top-k) scattered into -inf (LogitsProcessor.
+  get_sparse_logits, Qwen4Exp compute_logits_sparse, Sampler.sparse_logits_ok).
+  After the sampler's top-k/top-p the logits equal the full gather (W27 test).
+- VLLM_EXP_DRAFT_HEAD_INT8=1: per-row int8 copy of the LM head shard (303 MiB on
+  the last PP stage) for DFlash 2 candidate selection only, W8A16 skinny kernel
+  (373 us vs 731 us bf16 at 8 rows); top-16 overlap with the bf16 head 1.00 / 0.98.
+- VLLM_EXP_TOPK_FIRST=1 now uses FlashInfer's radix top-k (~80 us for 8 x 248K)
+  instead of torch.topk.
+
+W28 profile at 1 request vs p7 (W26): last-stage work per step 11.60 -> 11.07 ms,
+step period 20.80 -> 20.59 ms (first stage varies with sampled content); kernel
+view: int8 head -357 us, logits all-gather -196 us, sampler -176 us per step.
+GSM8K 97.5 (121 s, 491 tok/s), probes/poke clean, 0 runtime errors.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../model_executor/layers/logits_processor.py |  43 +++++-
+ vllm/model_executor/models/qwen3_dflash2.py   |   7 +-
+ vllm/models/qwen4_exp/nvidia/model.py         |   6 +
+ .../qwen4_exp/nvidia/ops/skinny_sm86.py       | 135 ++++++++++++++++++
+ vllm/v1/sample/ops/topk_topp_sampler.py       |  14 +-
+ vllm/v1/worker/gpu/model_runner.py            |  15 +-
+ vllm/v1/worker/gpu/sample/sampler.py          |  36 +++++
+ .../v1/worker/gpu/spec_decode/dflash/utils.py |   4 +
+ 8 files changed, 255 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
+index 694bb6b..5734554 100644
+--- a/vllm/model_executor/layers/logits_processor.py
++++ b/vllm/model_executor/layers/logits_processor.py
+@@ -256,6 +256,7 @@ class LogitsProcessor(PluggableLayer):
+         hidden_states: torch.Tensor,
+         k: int,
+         embedding_bias: torch.Tensor | None = None,
++        head_override: Callable[[torch.Tensor], torch.Tensor] | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         """Vocab-parallel top-k without all-gathering full logits.
+ 
+@@ -273,7 +274,14 @@ class LogitsProcessor(PluggableLayer):
+                 "non-positive logit scaling factors."
+             )
+ 
+-        logits = self._apply_head(lm_head, hidden_states, embedding_bias)
++        # head_override: an alternative projection onto this shard's vocab
++        # rows (the DFlash 2 drafter's int8 copy of the head, which only picks
++        # candidates; VLLM_EXP_DRAFT_HEAD_INT8).
++        logits = (
++            head_override(hidden_states)
++            if head_override is not None
++            else self._apply_head(lm_head, hidden_states, embedding_bias)
++        )
+ 
+         # Mask out padding entries beyond org_vocab_size on this shard.
+         num_pad = lm_head.shard_indices.num_org_vocab_padding
+@@ -297,6 +305,39 @@ class LogitsProcessor(PluggableLayer):
+             values = torch.tanh(values / self.soft_cap) * self.soft_cap
+         return ids, values
+ 
++    def get_sparse_logits(
++        self,
++        lm_head: VocabParallelEmbedding,
++        hidden_states: torch.Tensor,
++        k: int,
++        embedding_bias: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Full-vocab logits that keep only each TP shard's top-k entries and
++        are -inf elsewhere (VLLM_EXP_SPARSE_LOGITS). After any top-k <= k
++        sampling filter they equal the all-gathered logits (the global top-k
++        is inside the union of the shards' top-k), at O(batch * k * tp)
++        communication instead of O(batch * vocab). Soft cap and scale as in
++        forward(); the caller guarantees no logits processing that could lift
++        a token from outside the shards' top-k (penalties, bias, bad words,
++        logprobs, grammar)."""
++        if self.scale <= 0.0:
++            raise ValueError("sparse logits need a positive logit scale")
++        logits = self._apply_head(lm_head, hidden_states, embedding_bias)
++        num_pad = lm_head.shard_indices.num_org_vocab_padding
++        if num_pad > 0:
++            logits[..., -num_pad:] = -float("inf")
++        values, ids = _topk(logits, k)
++        ids = ids.to(torch.int64) + lm_head.shard_indices.org_vocab_start_index
++        if lm_head.tp_size > 1:
++            values = tensor_model_parallel_all_gather(values, dim=-1)
++            ids = tensor_model_parallel_all_gather(ids, dim=-1)
++        if self.soft_cap is not None:
++            values = torch.tanh(values / self.soft_cap) * self.soft_cap
++        if self.scale != 1.0:
++            values = values * self.scale
++        out = values.new_full((values.shape[0], self.org_vocab_size), float("-inf"))
++        return out.scatter_(1, ids, values)
++
+     def extra_repr(self) -> str:
+         s = f"vocab_size={self.vocab_size}"
+         s += f", org_vocab_size={self.org_vocab_size}"
+diff --git a/vllm/model_executor/models/qwen3_dflash2.py b/vllm/model_executor/models/qwen3_dflash2.py
+index c5a7411..8628391 100644
+--- a/vllm/model_executor/models/qwen3_dflash2.py
++++ b/vllm/model_executor/models/qwen3_dflash2.py
+@@ -285,8 +285,13 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
+     def compute_candidates(
+         self, hidden_states: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor]:
++        from vllm.models.qwen4_exp.nvidia.ops import skinny_sm86
++
+         return self.candidate_logits_processor.get_top_k_tokens(
+-            self.lm_head, hidden_states, self.model.candidate_selector.top_k
++            self.lm_head,
++            hidden_states,
++            self.model.candidate_selector.top_k,
++            head_override=skinny_sm86.draft_head_override(self, hidden_states),
+         )
+ 
+ 
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index 70ef9d0..3737f99 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -1282,6 +1282,12 @@ class Qwen4ExpForConditionalGeneration(
+             self._set_deepstack_input_embeds(deepstack_input_embeds)
+         return inputs_embeds
+ 
++    def compute_logits_sparse(self, hidden_states: torch.Tensor, k: int) -> torch.Tensor:
++        """Full-vocab logits keeping only each TP shard's top-k (see
++        LogitsProcessor.get_sparse_logits); VLLM_EXP_SPARSE_LOGITS."""
++        lm = self.language_model
++        return lm.logits_processor.get_sparse_logits(lm.lm_head, hidden_states, k)
++
+     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
+         return self.language_model.get_mtp_target_hidden_states()
+ 
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/skinny_sm86.py b/vllm/models/qwen4_exp/nvidia/ops/skinny_sm86.py
+index b3bf6a4..c0351b0 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/skinny_sm86.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/skinny_sm86.py
+@@ -50,6 +50,7 @@ logger = init_logger(__name__)
+ 
+ ENABLED = os.environ.get("VLLM_EXP_SKINNY_SM86", "0") == "1"
+ HC_FUSE = os.environ.get("VLLM_EXP_SKINNY_SM86_HC", "0") == "1"
++DRAFT_HEAD_INT8 = os.environ.get("VLLM_EXP_DRAFT_HEAD_INT8", "0") == "1"
+ PLANS_PATH = os.environ.get(
+     "VLLM_EXP_SKINNY_SM86_PLANS", "/opt/flash-next/skinny/plans-sm86.json"
+ )
+@@ -209,6 +210,51 @@ def _skinny_hc_up_mix_kernel(
+     )
+ 
+ 
++@triton.jit
++def _skinny_gemm_w8_kernel(
++    x_ptr,
++    q_ptr,
++    s_ptr,
++    y_ptr,
++    M,
++    N,
++    K,
++    stride_xm,
++    stride_qn,
++    stride_ym,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    # Y = X @ (Q * s)^T for an int8 weight with one fp32 scale per output row:
++    # int8 -> bf16 is exact, the scale is applied once in the epilogue.
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    offs_k = tl.arange(0, BLOCK_K)
++    m_mask = offs_m < M
++    n_mask = offs_n < N
++    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :]
++    q_ptrs = q_ptr + offs_n[:, None] * stride_qn + offs_k[None, :]
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    for _ in range(0, K, BLOCK_K):
++        x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
++        w = tl.load(
++            q_ptrs, mask=n_mask[:, None], other=0, eviction_policy="evict_first"
++        ).to(tl.bfloat16)
++        acc = tl.dot(x, tl.trans(w), acc)
++        x_ptrs += BLOCK_K
++        q_ptrs += BLOCK_K
++    scale = tl.load(s_ptr + offs_n, mask=n_mask, other=0.0)
++    acc = acc * scale[None, :]
++    tl.store(
++        y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :],
++        acc.to(y_ptr.dtype.element_ty),
++        mask=m_mask[:, None] & n_mask[None, :],
++    )
++
++
+ # (block_m, block_n, block_k, split_k, num_warps, num_stages)
+ Config = tuple[int, int, int, int, int, int]
+ 
+@@ -288,6 +334,92 @@ def launch_up_mix(
+     return y
+ 
+ 
++def launch_w8(
++    x: torch.Tensor,
++    q: torch.Tensor,
++    scale: torch.Tensor,
++    cfg: Config,
++    out: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Y = X @ (Q * scale[:, None])^T, Q int8 [N, K], scale fp32 [N]."""
++    bm, bn, bk, _, warps, stages = cfg
++    m, k = x.shape
++    n = q.shape[0]
++    y = out if out is not None else x.new_empty((m, n))
++    _skinny_gemm_w8_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn))](
++        x,
++        q,
++        scale,
++        y,
++        m,
++        n,
++        k,
++        x.stride(0),
++        q.stride(0),
++        y.stride(0),
++        BLOCK_M=bm,
++        BLOCK_N=bn,
++        BLOCK_K=bk,
++        num_warps=warps,
++        num_stages=stages,
++    )
++    return y
++
++
++def quantize_rows_int8(
++    w: torch.Tensor, chunk: int = 8192
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Symmetric per-row int8 (absmax / 127), in row chunks so the fp32
++    temporaries stay small (the 124K-row LM head shard is 636 MB in bf16)."""
++    q = torch.empty(w.shape, dtype=torch.int8, device=w.device)
++    s = torch.empty(w.shape[0], dtype=torch.float32, device=w.device)
++    for r in range(0, w.shape[0], chunk):
++        blk = w[r : r + chunk].float()
++        sc = blk.abs().amax(dim=1).clamp_min(1e-12) / 127.0
++        q[r : r + chunk] = torch.round(blk / sc[:, None]).clamp_(-127, 127).to(torch.int8)
++        s[r : r + chunk] = sc
++    return q, s
++
++
++def w8_plan(shape: tuple[int, int], m: int) -> Config | None:
++    load_plans()
++    return _w8_plans.get(shape, {}).get(m_bucket(m) or 0)
++
++
++def attach_int8_draft_head(model: nn.Module) -> None:
++    """VLLM_EXP_DRAFT_HEAD_INT8=1: give the DFlash 2 drafter an int8 copy of its
++    (shared, bf16) LM head shard for candidate selection only. The drafter's
++    candidates and scores come from it; verification still uses the target's
++    bf16 logits, so outputs are unchanged (drafts may differ slightly)."""
++    if not (DRAFT_HEAD_INT8 and is_supported()):
++        return
++    head = getattr(model, "lm_head", None)
++    weight = getattr(head, "weight", None)
++    if weight is None or weight.dim() != 2 or weight.device.type != "cuda":
++        return
++    q, s = quantize_rows_int8(weight.data)
++    model._draft_head_q = q
++    model._draft_head_s = s
++    logger.info(
++        "DFlash 2 drafter: int8 candidate head %s (%.0f MiB; w8 plans for M buckets %s)",
++        tuple(q.shape),
++        q.numel() / 2**20,
++        sorted(_w8_plans.get(tuple(q.shape), {})) or "none",
++    )
++
++
++def draft_head_override(model: nn.Module, hidden_states: torch.Tensor):
++    """Head projection for get_top_k_tokens(head_override=...), or None."""
++    q = getattr(model, "_draft_head_q", None)
++    if q is None or hidden_states.dim() != 2 or hidden_states.stride(1) != 1:
++        return None
++    cfg = w8_plan((int(q.shape[0]), int(q.shape[1])), hidden_states.shape[0])
++    if cfg is None or hidden_states.dtype != torch.bfloat16:
++        return None
++    s = model._draft_head_s
++    return lambda h: launch_w8(h, q, s, cfg)
++
++
+ def scratch_size(cfg: Config, n: int, m: int = M_MAX) -> tuple[int, int]:
+     """fp32 partial elements and counters a config needs for up to m x n."""
+     bm, bn, _, sk, _, _ = cfg
+@@ -306,6 +438,7 @@ def m_bucket(m: int) -> int | None:
+ 
+ _plans: dict[tuple[int, int], dict[int, Config]] | None = None
+ _mix_plans: dict[tuple[int, int], dict[int, Config]] = {}
++_w8_plans: dict[tuple[int, int], dict[int, Config]] = {}
+ # slot -> (weight shape, plan by M bucket, fp32 partials, int32 counters)
+ _slots: list[tuple[tuple[int, int], dict[int, Config], torch.Tensor, torch.Tensor]] = []
+ 
+@@ -324,6 +457,8 @@ def load_plans() -> dict[tuple[int, int], dict[int, Config]]:
+             target = _plans
+             if key.startswith("mix:"):
+                 key, target = key[4:], _mix_plans
++            elif key.startswith("w8:"):
++                key, target = key[3:], _w8_plans
+             n, k = (int(v) for v in key.split("x"))
+             target[(n, k)] = {int(m): tuple(c) for m, c in by_m.items()}
+     return _plans
+diff --git a/vllm/v1/sample/ops/topk_topp_sampler.py b/vllm/v1/sample/ops/topk_topp_sampler.py
+index 0d2fe23..4eb8667 100644
+--- a/vllm/v1/sample/ops/topk_topp_sampler.py
++++ b/vllm/v1/sample/ops/topk_topp_sampler.py
+@@ -376,10 +376,22 @@ _TOPK_FIRST = os.environ.get("VLLM_EXP_TOPK_FIRST", "0") == "1"
+ _TOPK_FIRST_MAX_K = 64
+ 
+ 
++def _top_values(logits: torch.Tensor, k: int) -> torch.Tensor:
++    """Top-k values per row, descending: FlashInfer's radix top-k when present
++    (~40 us for 8 x 124K logits in the 2026-10-21 profile; torch.topk took
++    ~360 us for 8 x 248K)."""
++    from vllm.model_executor.layers.logits_processor import _flashinfer_topk
++
++    impl = _flashinfer_topk() if logits.is_cuda else None
++    if impl is None:
++        return logits.topk(k, dim=-1).values
++    return impl(logits, k, sorted=True, deterministic=True)[0]
++
++
+ def _apply_top_k_first(
+     logits: torch.Tensor, k: torch.Tensor, p: torch.Tensor | None, max_k: int
+ ) -> torch.Tensor:
+-    vals = logits.topk(max_k, dim=-1).values  # [B, max_k], descending
++    vals = _top_values(logits, max_k)  # [B, max_k], descending
+     last = k.to(torch.long).clamp(1, max_k) - 1  # position of the k-th largest
+     if p is not None:
+         pos = torch.arange(max_k, device=logits.device)
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index bd642f1..0817b62 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -153,7 +153,7 @@ from vllm.v1.worker.gpu.sample.batch_shard import (
+ )
+ from vllm.v1.worker.gpu.sample.output import SamplerOutput
+ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
+-from vllm.v1.worker.gpu.sample.sampler import Sampler
++from vllm.v1.worker.gpu.sample.sampler import SPARSE_LOGITS_K, Sampler
+ from vllm.v1.worker.gpu.shutdown import free_before_shutdown
+ from vllm.v1.worker.gpu.spec_decode import init_speculator
+ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+@@ -224,6 +224,7 @@ def grammar_invalid_draft_positions(
+     return torch.tensor(positions, dtype=torch.int64, device=device)
+ 
+ 
++
+ class GPUModelRunner(LoRAModelRunnerMixin):
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         self.vllm_config = vllm_config
+@@ -1671,7 +1672,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             logits = logits[:, : self.vocab_size]
+         else:
+             sample_hidden_states = hidden_states[input_batch.logits_indices]
+-            logits = self.model.compute_logits(sample_hidden_states)
++            if (
++                grammar_output is None
++                and hasattr(self.sampler, "sparse_logits_ok")
++                and hasattr(self.model, "compute_logits_sparse")
++                and self.sampler.sparse_logits_ok(input_batch.idx_mapping_np)
++            ):
++                logits = self.model.compute_logits_sparse(
++                    sample_hidden_states, SPARSE_LOGITS_K
++                )
++            else:
++                logits = self.model.compute_logits(sample_hidden_states)
+ 
+         invalid_draft_positions = None
+         if grammar_output is not None:
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index 3541c6b..c48f0f4 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
++
+ import numpy as np
+ import torch
+ 
+@@ -29,6 +31,12 @@ from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
+ from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
+ from vllm.v1.worker.gpu.states import RequestState
+ 
++# VLLM_EXP_SPARSE_LOGITS=1 (2026-10-21): when sparse_logits_ok(), the target's
++# logits are gathered as each TP shard's top-SPARSE_LOGITS_K only (one 240 us
++# all-gather of 8 x 124K logits per decode step on the 3090s otherwise).
++SPARSE_LOGITS = os.environ.get("VLLM_EXP_SPARSE_LOGITS", "0") == "1"
++SPARSE_LOGITS_K = 64
++
+ 
+ class Sampler:
+     def __init__(
+@@ -103,6 +111,34 @@ class Sampler:
+         if self.trace_replay_state is not None:
+             self.trace_replay_state.apply_staged_writes()
+ 
++    def sparse_logits_ok(self, idx_mapping_np: np.ndarray) -> bool:
++        """VLLM_EXP_SPARSE_LOGITS: True when every scheduled request samples
++        from a top-k <= SPARSE_LOGITS_K, wants no logprobs, and has no logits
++        processing that could lift a token from outside the TP shards' top-k
++        (logit bias / allowed tokens / min_tokens, penalties, bad words,
++        thinking budget). Host-side state only, identical on every TP rank."""
++        if not SPARSE_LOGITS or len(idx_mapping_np) == 0:
++            return False
++        if self.trace_replay_state is not None:
++            return False
++        st = self.sampling_states
++        idx = idx_mapping_np
++        if np.any(st.top_k.np[idx] > SPARSE_LOGITS_K):
++            return False
++        if np.any(st.num_logprobs[idx] != NO_LOGPROBS):
++            return False
++        if (
++            np.any(self.logit_bias_state.use_logit_bias[idx])
++            or np.any(self.penalties_state.use_penalty[idx])
++            or np.any(self.bad_words_state.num_bad_words.np[idx] > 0)
++        ):
++            return False
++        if self.thinking_budget_state.enabled and np.any(
++            self.thinking_budget_state.use_thinking_budget[idx]
++        ):
++            return False
++        return True
++
+     def get_logprobs_dims(
+         self, idx_mapping_np: np.ndarray, include_token_ids: bool = True
+     ) -> tuple[int, int] | None:
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py b/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+index 7323b29..bc36c51 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+@@ -67,4 +67,8 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+             del dflash_model.lm_head
+         dflash_model.lm_head = target_lm_head
+ 
++    # VLLM_EXP_DRAFT_HEAD_INT8: int8 copy of the head for candidate selection
++    from vllm.models.qwen4_exp.nvidia.ops import skinny_sm86
++
++    skinny_sm86.attach_int8_draft_head(dflash_model)
+     return dflash_model
+-- 
+2.53.0
+

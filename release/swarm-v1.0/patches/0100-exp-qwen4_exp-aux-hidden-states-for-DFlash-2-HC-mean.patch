@@ -1,0 +1,175 @@
+From ba96472570097f61f33d6a585ec7bcfa5bd94483 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 17:08:23 +0300
+Subject: [PATCH 100/138] exp: qwen4_exp aux hidden states for DFlash 2
+ (HC-mean of layers 5/15/25/35/45, PP relay) + env-gated FP4 main-KV fake
+ quant (VLLM_EXP_QSA_KV_FP4_FAKE)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/models/qwen4_exp/nvidia/model.py | 50 +++++++++++++++++++++++++--
+ vllm/models/qwen4_exp/nvidia/qsa.py   | 44 +++++++++++++++++++++++
+ 2 files changed, 92 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/model.py b/vllm/models/qwen4_exp/nvidia/model.py
+index fe416d4..70ef9d0 100644
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -35,6 +35,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     should_use_host_embed_table,
+ )
+ from vllm.model_executor.models.interfaces import (
++    EagleModelMixin,
+     HasInnerState,
+     IsHybrid,
+     MambaStateShapes,
+@@ -512,8 +513,32 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
+         "deepstack_input_embeds": 0,
+     }
+ )
+-class Qwen4ExpModel(nn.Module):
++class Qwen4ExpModel(nn.Module, EagleModelMixin):
+     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
++    # local (DFlash 2 experiment): auxiliary hidden states for a DFlash/EAGLE-3
++    # style drafter. Each capture is the materialized multi-stream state after a
++    # layer, averaged over the hc_count streams ([T, H]), which is what
++    # incoai/Qwen3.8-Flash-Next-DFlash2 was trained on (its SGLang capture
++    # patch). Captures made on an earlier PP stage ride in the intermediate
++    # tensors as aux_hidden_states_<i> (EagleModelMixin layout).
++    supports_aux_hidden_states_over_pp = True
++
++    def _aux_capture(
++        self,
++        layer: nn.Module,
++        hidden_states: torch.Tensor,
++        block_output: torch.Tensor | None,
++        injection: torch.Tensor | None,
++    ) -> torch.Tensor:
++        # The HC combine is delayed into the next layer; materialize it out of
++        # place (hc_combine does not mutate its inputs) for the capture only.
++        if block_output is not None:
++            hidden_states = layer.mlp_hyper_connection.combine(
++                hidden_states, block_output, injection
++            )
++        return hidden_states.unflatten(
++            -1, (self.config.hc_count, self.config.hidden_size)
++        ).mean(dim=-2)
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+         super().__init__()
+@@ -661,6 +686,16 @@ class Qwen4ExpModel(nn.Module):
+                 raise ValueError("pipeline stage requires intermediate tensors")
+             hidden_states = intermediate_tensors["hidden_states"]
+ 
++        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
++        aux_hidden_states: list[torch.Tensor] = []
++        if (
++            get_pp_group().is_first_rank
++            and self.start_layer in self.aux_hidden_state_layers
++        ):
++            aux_hidden_states.append(
++                self._aux_capture(None, hidden_states, None, None)
++            )
++
+         block_output = None
+         injection = None
+         last_layer = None
+@@ -716,6 +751,10 @@ class Qwen4ExpModel(nn.Module):
+                 block_output = None
+                 injection = None
+                 hidden_states = hidden_states + deepstack_embed
++            if layer_idx + 1 in self.aux_hidden_state_layers:
++                aux_hidden_states.append(
++                    self._aux_capture(layer, hidden_states, block_output, injection)
++                )
+ 
+         if not get_pp_group().is_last_rank:
+             # PP transports one tensor, not the delayed HC tuple. Materialize
+@@ -724,7 +763,12 @@ class Qwen4ExpModel(nn.Module):
+                 hidden_states = last_layer.mlp_hyper_connection.combine(
+                     hidden_states, block_output, injection
+                 )
+-            return IntermediateTensors({"hidden_states": hidden_states})
++            return IntermediateTensors(
++                {
++                    "hidden_states": hidden_states,
++                    **self.pack_local_aux_hidden_states(aux_hidden_states),
++                }
++            )
+ 
+         # The final mixer consumes the last pending combine and returns both
+         # the sampled single stream and the materialized multi-stream state.
+@@ -739,6 +783,8 @@ class Qwen4ExpModel(nn.Module):
+             # this tensor is needed by the final mixer regardless).
+             num_tokens = multi_hidden.shape[0]
+             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
++        if self.aux_hidden_state_layers:
++            return sample_hidden_states, remote_aux + aux_hidden_states
+         return sample_hidden_states
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+diff --git a/vllm/models/qwen4_exp/nvidia/qsa.py b/vllm/models/qwen4_exp/nvidia/qsa.py
+index a10f0a7..912e532 100644
+--- a/vllm/models/qwen4_exp/nvidia/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/qsa.py
+@@ -290,6 +290,47 @@ def _qsa_clip_count(
+     ctr[1] += v_over.sum()
+ # ------------------------------------------------------------------------------
+ 
++# --- local experiment: FP4 main-KV fake quantization --------------------------
++# VLLM_EXP_QSA_KV_FP4_FAKE=1 rounds K/V, right before the cache write, to what a
++# DeepSeek-V4.1-style FP4 main KV can hold: E2M1 values with one E4M3 scale per
++# 16 consecutive elements of head_dim and no global scale. Storage stays the
++# production FP8 cache (the rounded values are re-quantized by the normal FP8
++# writer), so this only measures the quality cost; it saves no memory. The
++# extra FP8 rounding on top makes it slightly pessimistic vs real FP4 storage.
++_QSA_KV_FP4_FAKE = os.environ.get("VLLM_EXP_QSA_KV_FP4_FAKE", "0") == "1"
++_FP4_GROUP = 16
++_FP4_E2M1_MAX = 6.0
++_fp4_tables: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
++
++
++def _fp4_e2m1_tables(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
++    tables = _fp4_tables.get(device)
++    if tables is None:
++        # Round to nearest E2M1 magnitude {0, .5, 1, 1.5, 2, 3, 4, 6}: the
++        # boundaries are the midpoints. Allocated on the first (eager) forward.
++        boundaries = torch.tensor(
++            [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=torch.float32, device=device
++        )
++        values = torch.tensor(
++            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32, device=device
++        )
++        tables = (boundaries, values)
++        _fp4_tables[device] = tables
++    return tables
++
++
++def _fp4_fake_quant(x: torch.Tensor) -> torch.Tensor:
++    """[T, H, D] BF16 -> the same values rounded through per-16 E2M1 x E4M3 scale."""
++    boundaries, values = _fp4_e2m1_tables(x.device)
++    shape = x.shape
++    g = x.float().reshape(*shape[:-1], shape[-1] // _FP4_GROUP, _FP4_GROUP)
++    absmax = g.abs().amax(dim=-1, keepdim=True)
++    scale = (absmax / _FP4_E2M1_MAX).to(torch.float8_e4m3fn).float()
++    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
++    q = values[torch.bucketize((g / scale).abs(), boundaries)]
++    return (torch.sign(g) * q * scale).reshape(shape).to(x.dtype)
++# ------------------------------------------------------------------------------
++
+ _QSA_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
+ _QSA_SUPPORTED_CACHE_DTYPES = ("auto", "bfloat16", *_QSA_FP8_CACHE_DTYPES)
+ 
+@@ -811,6 +852,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
+             self.kv_cache_dtype
+         ):
+             _qsa_clip_count(self, key, value, main_metadata.slot_mapping)
++        if _QSA_KV_FP4_FAKE:
++            key = _fp4_fake_quant(key)
++            value = _fp4_fake_quant(value)
+         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
+         impl.do_kv_cache_update(
+             self,
+-- 
+2.53.0
+

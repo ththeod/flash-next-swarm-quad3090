@@ -1,0 +1,305 @@
+From 747ee17b6148f7845f1ec974783b3b39b3790c24 Mon Sep 17 00:00:00 2001
+From: ththeod <2376818+ththeod@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 04:22:59 +0300
+Subject: [PATCH 135/138] fp4 perf: dedicated FP4 split-K QSA kernel
+ (contiguous packed-byte + scale loads, even/odd nibble halves in uint16, two
+ half dots): the shared kernel's per-element byte gathers ran prefill 67x
+ slower than FP8 (fp4_kernel_bench). VLLM_EXP_QSA_FP4_KERNEL=split (default) |
+ legacy; warmup compiles the same
+
+(cherry picked from commit 7cac0921233d6bd9e1f34853b544027a68967993)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ vllm/models/qwen4_exp/nvidia/ops/qsa.py | 240 +++++++++++++++++++++++-
+ 1 file changed, 236 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/qsa.py b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+index 73979e0..d99cb93 100644
+--- a/vllm/models/qwen4_exp/nvidia/ops/qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/ops/qsa.py
+@@ -88,6 +88,8 @@ def _encode_e4m3(x):
+ import os as _os
+ 
+ _QSA_FP4_WARPS = int(_os.environ.get("VLLM_EXP_QSA_FP4_WARPS", "0"))
++# "split" (default): _qsa_sparse_paged_gqa_splitk_fp4_kernel; "legacy": the shared kernel's KV_DTYPE == 3 branch.
++_QSA_FP4_KERNEL = _os.environ.get("VLLM_EXP_QSA_FP4_KERNEL", "split")
+ 
+ 
+ @triton.jit
+@@ -500,6 +502,225 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
+         )
+ 
+ 
++@triton.jit
++def _decode_e2m1_bf16_u16(nib):
++    """_decode_e2m1_bf16 in uint16 arithmetic (half the registers of int32)."""
++    nib = nib.to(tl.uint16)
++    code = nib & 7
++    e = code >> 1
++    m = code & 1
++    exp = tl.where(e == 0, m * 126, e + 126)
++    mant = tl.where(e == 0, 0, m << 6)
++    bits = ((nib & 8) << 12) | (exp << 7) | mant
++    return bits.to(tl.uint16).to(tl.bfloat16, bitcast=True)
++
++
++@triton.jit(do_not_specialize=["num_rows", "num_requests"])
++def _qsa_sparse_paged_gqa_splitk_fp4_kernel(
++    q_ptr,
++    k_cache_ptr,
++    v_cache_ptr,
++    k_scale_ptr,
++    v_scale_ptr,
++    indices_ptr,
++    block_table_ptr,
++    token_to_req_ptr,
++    partial_output_ptr,
++    partial_lse_ptr,
++    output_ptr,
++    output_gate_ptr,
++    stride_q_row,
++    stride_q_head,
++    stride_k_block,
++    stride_k_token,
++    stride_k_head,
++    stride_v_block,
++    stride_v_token,
++    stride_v_head,
++    stride_indices_row,
++    stride_table_req,
++    stride_output_row,
++    stride_output_head,
++    stride_output_gate_row,
++    stride_output_gate_head,
++    num_rows,
++    num_cache_blocks,
++    num_requests,
++    TOPK: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    PAGE_TABLE_WIDTH: tl.constexpr,
++    GROUP_SIZE: tl.constexpr,
++    HEAD_DIM: tl.constexpr,
++    NUM_QUERY_HEADS: tl.constexpr,
++    NUM_SPLITS: tl.constexpr,
++    NUM_TILES: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++) -> None:
++    """local (2026-10-21): FP4 K/V version of _qsa_sparse_paged_gqa_splitk_kernel.
++
++    The KV_DTYPE == 3 branch of the shared kernel loaded one byte per element (twice
++    per byte: address dim // 2) plus one scale byte per element, as int32 [HEAD_DIM x
++    BLOCK_N] tiles: ~30x the load instructions of the vectorized FP8 path and register
++    spills (prefill 67x slower than FP8 in this kernel, fp4_kernel_bench.py). Here each
++    token's HEAD_DIM/2 packed bytes and HEAD_DIM/16 scale bytes are loaded contiguously,
++    the low/high nibbles (even/odd dims, the writer's packing) decode to two BF16 halves
++    in uint16 arithmetic, the scales broadcast in registers, and both dots are split:
++    scores = q_even . k_even + q_odd . k_odd, acc_even/odd += p . v_even/odd. Same values
++    as the shared kernel (E2M1 x E4M3 is exact in BF16); only the summation order of
++    the two half-dots differs (fp32).
++    """
++    row = tl.program_id(0)
++    kv_head = tl.program_id(1)
++    split_id = tl.program_id(2)
++    request = tl.load(token_to_req_ptr + row)
++    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
++    valid_count = tl.load(indices_ptr + row * stride_indices_row + TOPK)
++
++    HALF: tl.constexpr = HEAD_DIM // 2
++    GROUPS: tl.constexpr = HEAD_DIM // 16
++    head_offsets = tl.arange(0, BLOCK_M)
++    half_offsets = tl.arange(0, HALF)
++    group_offsets = tl.arange(0, GROUPS)
++    column_offsets = tl.arange(0, BLOCK_N)
++    first_head = kv_head * GROUP_SIZE
++    head_mask = head_offsets[:, None] < GROUP_SIZE
++    q_base = (
++        q_ptr
++        + row * stride_q_row
++        + (first_head + head_offsets[:, None]) * stride_q_head
++        + 2 * half_offsets[None, :]
++    )
++    q_even = tl.load(q_base, mask=head_mask, other=0.0)
++    q_odd = tl.load(q_base + 1, mask=head_mask, other=0.0)
++
++    max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
++    normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
++    acc_even = tl.zeros((BLOCK_M, HALF), dtype=tl.float32)
++    acc_odd = tl.zeros((BLOCK_M, HALF), dtype=tl.float32)
++    softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
++    k_scale_value = tl.load(k_scale_ptr)
++    v_scale_value = tl.load(v_scale_ptr)
++
++    tile_end = tl.minimum(NUM_TILES, tl.cdiv(tl.minimum(valid_count, TOPK), BLOCK_N))
++    for tile in range(split_id, tile_end, NUM_SPLITS):
++        columns = tile * BLOCK_N + column_offsets
++        logical_token = tl.load(
++            indices_ptr + row * stride_indices_row + columns,
++            mask=columns < TOPK,
++            other=-1,
++        )
++        safe_token = tl.maximum(logical_token, 0)
++        logical_page = safe_token // PAGE_SIZE
++        page_offset = safe_token % PAGE_SIZE
++        valid = (
++            (request >= 0)
++            & (request < num_requests)
++            & (logical_token >= 0)
++            & (logical_page < PAGE_TABLE_WIDTH)
++        )
++        physical_page = tl.load(
++            block_table_ptr
++            + safe_request * stride_table_req
++            + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
++            mask=valid,
++            other=-1,
++        )
++        valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
++        safe_page = tl.maximum(physical_page, 0).to(tl.int64)
++
++        # keys: [HALF, BLOCK_N] packed bytes + [GROUPS, BLOCK_N] scales, one row per token
++        key_row = (
++            k_cache_ptr
++            + safe_page[None, :] * stride_k_block
++            + page_offset[None, :] * stride_k_token
++            + kv_head * stride_k_head
++        )
++        key_bytes = tl.load(key_row + half_offsets[:, None], mask=valid[None, :], other=0)
++        key_scales = _decode_e4m3_to_bf16(
++            tl.load(key_row + HALF + group_offsets[:, None], mask=valid[None, :], other=0)
++        )
++        # half-dim j covers dims 2j and 2j+1, both in scale group j // 8
++        key_scales = tl.reshape(
++            tl.broadcast_to(key_scales[:, None, :], (GROUPS, 8, BLOCK_N)), (HALF, BLOCK_N)
++        )
++        k_even = _decode_e2m1_bf16_u16(key_bytes & 0xF) * key_scales
++        k_odd = _decode_e2m1_bf16_u16(key_bytes >> 4) * key_scales
++        scores = tl.dot(q_even, k_even) + tl.dot(q_odd, k_odd)
++        scores *= softmax_scale_log2 * k_scale_value
++        scores = tl.where(valid[None, :], scores, -1.0e20)
++        next_max = tl.maximum(max_value, tl.max(scores, axis=1))
++        alpha = tl.math.exp2(max_value - next_max)
++        probabilities = tl.where(
++            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
++        )
++
++        value_row = (
++            v_cache_ptr
++            + safe_page[:, None] * stride_v_block
++            + page_offset[:, None] * stride_v_token
++            + kv_head * stride_v_head
++        )
++        value_bytes = tl.load(value_row + half_offsets[None, :], mask=valid[:, None], other=0)
++        value_scales = _decode_e4m3_to_bf16(
++            tl.load(value_row + HALF + group_offsets[None, :], mask=valid[:, None], other=0)
++        )
++        value_scales = tl.reshape(
++            tl.broadcast_to(value_scales[:, :, None], (BLOCK_N, GROUPS, 8)), (BLOCK_N, HALF)
++        )
++        v_even = _decode_e2m1_bf16_u16(value_bytes & 0xF) * value_scales
++        v_odd = _decode_e2m1_bf16_u16(value_bytes >> 4) * value_scales
++        p = probabilities.to(tl.bfloat16)
++        acc_even = tl.dot(p, v_even, acc=acc_even * alpha[:, None])
++        acc_odd = tl.dot(p, v_odd, acc=acc_odd * alpha[:, None])
++        normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
++        max_value = next_max
++
++    has_values = normalizer > 0
++    inv = 1.0 / tl.maximum(normalizer, 1.0e-20)
++    out_even = tl.where(has_values[:, None], acc_even * inv[:, None], 0.0) * v_scale_value
++    out_odd = tl.where(has_values[:, None], acc_odd * inv[:, None], 0.0) * v_scale_value
++    output_mask = head_mask
++    if NUM_SPLITS == 1:
++        out_even = out_even.to(output_ptr.dtype.element_ty)
++        out_odd = out_odd.to(output_ptr.dtype.element_ty)
++        gate_base = (
++            output_gate_ptr
++            + row * stride_output_gate_row
++            + (first_head + head_offsets[:, None]) * stride_output_gate_head
++            + 2 * half_offsets[None, :]
++        )
++        gate_even = tl.load(gate_base, mask=output_mask, other=0.0).to(tl.float32)
++        gate_odd = tl.load(gate_base + 1, mask=output_mask, other=0.0).to(tl.float32)
++        out_base = (
++            output_ptr
++            + row * stride_output_row
++            + (first_head + head_offsets[:, None]) * stride_output_head
++            + 2 * half_offsets[None, :]
++        )
++        tl.store(out_base, out_even.to(tl.float32) * tl.sigmoid(gate_even), mask=output_mask)
++        tl.store(out_base + 1, out_odd.to(tl.float32) * tl.sigmoid(gate_odd), mask=output_mask)
++    else:
++        partial_lse = tl.where(
++            has_values,
++            max_value + tl.math.log2(tl.maximum(normalizer, 1.0e-20)),
++            -float("inf"),
++        )
++        partial_row = (split_id * num_rows + row).to(tl.int64)
++        part_base = (
++            partial_output_ptr
++            + (partial_row * NUM_QUERY_HEADS + first_head + head_offsets[:, None]) * HEAD_DIM
++            + 2 * half_offsets[None, :]
++        )
++        tl.store(part_base, out_even, mask=output_mask)
++        tl.store(part_base + 1, out_odd, mask=output_mask)
++        tl.store(
++            partial_lse_ptr + partial_row * NUM_QUERY_HEADS + first_head + head_offsets,
++            partial_lse,
++            mask=head_offsets < GROUP_SIZE,
++        )
++
++
+ @triton.jit(do_not_specialize=["num_rows"])
+ def _qsa_merge_splitk_kernel(
+     partial_output_ptr,
+@@ -932,7 +1153,13 @@ def qsa_sparse_paged_attention(
+         )
+ 
+     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
+-    _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
++    fp4_split = kv_fp4 and _QSA_FP4_KERNEL == "split"
++    splitk_kernel = (
++        _qsa_sparse_paged_gqa_splitk_fp4_kernel
++        if fp4_split
++        else _qsa_sparse_paged_gqa_splitk_kernel
++    )
++    splitk_kernel[partial_grid](
+         q,
+         k_cache,
+         v_cache,
+@@ -970,7 +1197,7 @@ def qsa_sparse_paged_attention(
+         NUM_QUERY_HEADS=q.shape[1],
+         NUM_SPLITS=num_splits,
+         NUM_TILES=num_tiles,
+-        KV_DTYPE=kv_dtype,
++        **({} if fp4_split else {"KV_DTYPE": kv_dtype}),
+         BLOCK_M=block_m,
+         BLOCK_N=block_n,
+         num_warps=partial_warps,
+@@ -1099,7 +1326,12 @@ def warmup_qsa_sparse_paged_attention(
+             partial_lse_ptr = TritonWarmupTensor(
+                 torch.float32, shape=(num_splits, num_rows, num_query_heads)
+             )
+-        _qsa_sparse_paged_gqa_splitk_kernel.warmup(
++        warm_fp4_split = kv_fp4 and _QSA_FP4_KERNEL == "split"
++        (
++            _qsa_sparse_paged_gqa_splitk_fp4_kernel
++            if warm_fp4_split
++            else _qsa_sparse_paged_gqa_splitk_kernel
++        ).warmup(
+             q_ptr,
+             k_cache_ptr,
+             v_cache_ptr,
+@@ -1137,7 +1369,7 @@ def warmup_qsa_sparse_paged_attention(
+             NUM_QUERY_HEADS=num_query_heads,
+             NUM_SPLITS=num_splits,
+             NUM_TILES=num_tiles,
+-            KV_DTYPE=warm_kv_dtype,
++            **({} if warm_fp4_split else {"KV_DTYPE": warm_kv_dtype}),
+             BLOCK_M=block_m,
+             BLOCK_N=block_n,
+             num_warps=warps,
+-- 
+2.53.0
+
