@@ -5,7 +5,7 @@ title: "Four RTX 3090s, one 125B MoE, forty coding agents"
 
 # Four RTX 3090s, one 125B MoE, forty coding agents
 
-*A fork of halt95's Flash-Next engine that serves coding-agent swarms on consumer GPUs without giving up quality. ththeod, October 2026.
+*flash-next-swarm-quad3090: coding-agent swarms on consumer GPUs without giving up quality, built on halt95's Flash-Next engine. ththeod, October 2026.
 Code, patches and benchmarks: [github.com/ththeod/flash-next-swarm-quad3090](https://github.com/ththeod/flash-next-swarm-quad3090)*
 
 <picture>
@@ -18,7 +18,7 @@ halt95's [Flash-Next engine](https://github.com/halt95/merlin-engine) is the rea
 Qwen3.8-Flash-Next runs on four RTX 3090s at all, but its GPU cache fits fewer than ten conversations that long. In a
 swarm of forty, almost every turn starts by recomputing its prompt from scratch.
 
-flash-next-swarm-quad3090 is a fork of halt95's v2.5.2 with 40 changes for that workload. It serves Swift 1.5, a
+flash-next-swarm-quad3090 adds 40 changes for that workload on top of halt95's v2.5.2. It serves Swift 1.5, a
 fine-tune of Qwen3.8-Flash-Next, and adds:
 
 - a RAM tier that keeps conversations warm;
@@ -27,7 +27,7 @@ fine-tune of Qwen3.8-Flash-Next, and adds:
 - less wasted work per generated token;
 - faster communication between the GPUs.
 
-On the same hardware and the same day, a 40-agent benchmark ran at 26.5 turns a minute on the fork and 4.2 on
+On the same hardware and the same day, a 40-agent benchmark ran at 26.5 turns a minute on flash-next-swarm-quad3090 and 4.2 on
 halt95's latest release, Merlin 3.0.0. Both builds scored the same on HumanEval and MMLU-Pro.
 
 The numbers in this post were measured with the optional third-party BF16 unlock and a 1400 MHz clock lock. The
@@ -44,7 +44,7 @@ A swarm is bigger than that. Forty subagents with 100K-token prompts need severa
 them, and four 3090s hold about 925K. Whatever doesn't fit is evicted and later recomputed, at a few thousand tokens
 per second, while the agent waits.
 
-So the fork aims to keep many long conversations warm, generate for many requests at once, and let a fresh prompt in
+So the goal is to keep many long conversations warm, generate for many requests at once, and let a fresh prompt in
 without stalling everyone else. And every answer has to be as good as before.
 
 ## How we measured
@@ -77,9 +77,9 @@ To decide what to try, we profiled: we recorded where every millisecond of a gen
 and timed slow pieces of GPU code on their own. One tip if you tune GPU code on 3090s: leave idle gaps between timing
 runs. Back to back under a power cap, the cards throttle so hard that the timings pick the wrong settings.
 
-## What the fork changes
+## What we changed
 
-Each section says what was slow before, what the fork does differently, and why that helps. The patch numbers point
+Each section says what was slow before, what changed, and why that helps. The patch numbers point
 to the code in `release/swarm-v1.0/patches/`.
 
 One thing helps with the rest: the model runs in two halves, each on a pair of GPUs. The halves work like an assembly
@@ -95,8 +95,8 @@ Attention layers keep a note for every token, and those notes can be copied out 
 keep one running summary of the whole conversation instead, and that summary only exists where it was saved. To
 resume from RAM, you need a summary saved at exactly the token where the last turn ended.
 
-The fork saves that summary at the end of every turn and resumes from there. Loading a conversation back from RAM is
-much faster than recomputing it, so in the swarm benchmark 96% of prompt tokens now come from RAM. The fork also fixes
+The server now saves that summary at the end of every turn and resumes from there. Loading a conversation back from RAM is
+much faster than recomputing it, so in the swarm benchmark 96% of prompt tokens now come from RAM. We also fixed
 the bugs that showed up under real swarms:
 
 - the two GPU pairs overwrote each other's data in RAM;
@@ -113,13 +113,13 @@ When a GPU generates text one token at a time, it spends most of each step readi
 token. Speculative decoding makes better use of that work. A small, fast drafter guesses several tokens ahead, and the
 big model checks all the guesses in one step, keeping the ones it agrees with.
 
-halt95's build uses the model's built-in drafter (MTP), which guesses 3 tokens at a time. The fork uses incoai's
+halt95's build uses the model's built-in drafter (MTP), which guesses 3 tokens at a time. We switched to incoai's
 [DFlash 2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2). It is a separately trained drafter that sees
 more of the big model's internal state and guesses up to 7 tokens. It is right more often: 3.4–3.6 tokens are kept
 per step, against 3.1. So every step produces more text, and a single request on a code prompt decodes about 50%
 faster.
 
-With many requests the GPUs are already busy, so wrong guesses cost more. The fork makes fewer guesses as load grows,
+With many requests the GPUs are already busy, so wrong guesses cost more. The server makes fewer guesses as load grows,
 down to 2.
 
 *Patches 0100–0103, 0108–0113.*
@@ -127,7 +127,7 @@ down to 2.
 ### 3. More room: a 4-bit KV cache
 
 The KV cache is the model's working memory: notes on every token of every conversation it holds. Its size decides how
-many tokens fit in VRAM at once. halt95's build stores those notes as 8-bit numbers. The fork stores them as 4-bit
+many tokens fit in VRAM at once. halt95's build stores those notes as 8-bit numbers. We store them as 4-bit
 numbers, with a shared scale for every 16 values, so the same VRAM holds 26–28% more tokens.
 
 The first 4-bit version made prompt processing several times slower, for two reasons:
@@ -135,10 +135,10 @@ The first 4-bit version made prompt processing several times slower, for two rea
 - unpacking each 4-bit number used slow floating-point math;
 - the attention code was tuned for 8-bit data.
 
-The fork unpacks with simple bit operations, which give exactly the same values, and uses attention code written for
+The new version unpacks with simple bit operations, which give exactly the same values, and uses attention code written for
 4-bit data. It now runs as fast as 8-bit, and the scores didn't drop (see [Keeping quality](#keeping-quality)).
 
-The fork also gives DFlash 2 its own small cache. Otherwise the drafter's memory needs would have cut the main cache
+DFlash 2 also gets its own small cache. Otherwise the drafter's memory needs would have cut the main cache
 to a third. Altogether the cache holds 1.21M tokens, against 925K in halt95's build.
 
 *Patches 0104–0107, 0133–0135.*
@@ -147,18 +147,18 @@ to a third. Altogether the cache holds 1.21M tokens, against 925K in halt95's bu
 
 Profiling one generation step showed that half the time went to matrix multiplications. The GPU's math units work on
 blocks of 16 rows, but a single request only gives them 8 (one token plus seven guesses), so the blocks ran half empty.
-The fork changes three things:
+We changed three things:
 
-- it adds matrix code sized for these small batches;
-- it switches back on a fast method for adding up partial results between GPUs, which the inherited configuration had
-  turned off;
-- it trims the work of picking the next token.
+- new matrix code sized for these small batches;
+- a fast method for adding up partial results between GPUs, switched back on after the inherited configuration had
+  turned it off;
+- less work in picking the next token.
 
 A single request now decodes about 23% faster.
 
 With several requests at once, a different problem showed up. The assembly line works on two groups of requests and
-moves at the pace of the bigger group, and the groups were often uneven: 6 and 2 instead of 4 and 4. The fork keeps
-them even, which makes 16 requests 34% faster.
+moves at the pace of the bigger group, and the groups were often uneven: 6 and 2 instead of 4 and 4. The server now
+keeps them even, which makes 16 requests 34% faster.
 
 *Patches 0114–0118, 0131.*
 
@@ -171,12 +171,12 @@ processed.
 The cause was traffic between the GPUs. The two GPUs in a pair add up their partial results after every layer. The
 fast method from section 4 is only fast when both GPUs connect to the same PCIe branch of the CPU. On many boards they
 don't, and for the large transfers of prompt processing, the fast method took almost four times as long as NVIDIA's
-standard library, NCCL. The fork changes three things:
+standard library, NCCL. We changed three things:
 
-- it checks how the GPUs are connected at startup, and uses the fast method only for small transfers on a shared
-  branch;
-- it lets NCCL switch to its faster mode for large transfers;
-- it uses FlashInfer's newer method for small transfers, as halt95's Merlin 3.0.0 does.
+- the server checks how the GPUs are connected at startup, and uses the fast method only for small transfers on a
+  shared branch;
+- NCCL may now switch to its faster mode for large transfers;
+- small transfers use FlashInfer's newer method, as in halt95's Merlin 3.0.0.
 
 With these changes and the faster prompt processing from sections 6 and 7, the freeze is down to 3.6 seconds. The
 other requests keep generating at 100–115 tok/s through it.
@@ -190,7 +190,7 @@ does on the same chip in a workstation card, but 8-bit integer math (INT8) runs 
 
 vLLM can convert the numbers going into the model's expert layers to INT8 on the fly. With this model, though, it
 produced garbage from the first token, because of two bugs in how it handled the scale factors that keep 8-bit values
-accurate. The fork fixes both. Fixes by other people for the same bugs are waiting in vLLM (PRs #61405, #48926 and
+accurate. We fixed both. Fixes by other people for the same bugs are waiting in vLLM (PRs #61405, #48926 and
 #59895).
 
 Prompt processing is 11–12% faster on stock cards, at a small cost on code (see [Keeping quality](#keeping-quality)).
@@ -218,7 +218,7 @@ Speed changes are easy to make and easy to get wrong, so every change went throu
 release configuration's results, with reasoning at `xhigh` and a 64K-token budget. For HumanEval and MMLU-Pro, the
 table also shows halt95's Merlin 3.0.0, run on the same model on the same day:
 
-| Check | This fork | Merlin 3.0.0 |
+| Check | flash-next-swarm-quad3090 | Merlin 3.0.0 |
 |---|---|---|
 | HumanEval | 161/164 | 161/164 |
 | MMLU-Pro, 280 questions | 236/280 | 237/280 |
@@ -258,9 +258,9 @@ halt95's release, which has no RAM tier.
 
 ## Against halt95's latest: Merlin 3.0.0
 
-We ran halt95's current release next to the fork on the same hardware, on the same day, with the same benchmarks.
+We ran halt95's current release next to ours on the same hardware, on the same day, with the same benchmarks.
 Merlin used its own launcher for this checkpoint: MTP with 3 drafts, FP8 KV, at most 8 requests at once and no RAM
-tier. The fork's figures in this section come from the same day's run, so they differ from the results table above.
+tier. Our figures in this section come from the same day's run, so they differ from the results table above.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/vs-merlin-swarm-dark.svg">
@@ -269,7 +269,7 @@ tier. The fork's figures in this section come from the same day's run, so they d
 
 The swarm is where the two designs differ most. Merlin's 925K-token cache holds fewer than ten of the forty
 conversations. It recomputes 99% of every prompt, and requests wait 425 seconds on average for a slot. With the RAM
-tier, the fork recomputes 4% and requests wait 52 seconds. That's 26.5 turns per minute against 4.2.
+tier, flash-next-swarm-quad3090 recomputes 4% and requests wait 52 seconds. That's 26.5 turns per minute against 4.2.
 
 To be fair to Merlin, this is a workload it doesn't claim to serve. Its own bench card measures eight agents with
 16K-token conversations.
@@ -279,16 +279,16 @@ To be fair to Merlin, this is a workload it doesn't claim to serve. Its own benc
   <img src="assets/vs-merlin-light.svg" alt="Ours relative to Merlin 3.0.0: 16 requests 2.02x, 1 request short prompt 1.92x, 8 requests 1.30x, 8 at 80K 1.22x, 1 after 260K 1.14x, 8 agents 1.11x, prefill 50K 1.11x, prefill 260K 1.10x, 1 request thinking on at 4K 0.93x" width="100%">
 </picture>
 
-On the smaller tests, the fork is ahead by 10–30% on prefill, long-context decode and 8 requests. At 16 requests the
+On the smaller tests, flash-next-swarm-quad3090 is ahead by 10–30% on prefill, long-context decode and 8 requests. At 16 requests the
 gap is about 2×, because Merlin serves at most 8 requests at a time and the rest wait. A single short request is 1.9×
 faster too. That comes mostly from the drafter and the less wasteful generation steps (sections 2 and 4).
 
 Merlin wins one test, by 7%: a single request with thinking on and a 4K prompt. Thinking text is harder to guess than
-code, and for a single request the fork makes 7 guesses per step. Most likely, Merlin's 3 guesses waste less work
+code, and for a single request ours makes 7 guesses per step. Most likely, Merlin's 3 guesses waste less work
 there.
 
 halt95 doesn't publish the bench card's drivers, so we re-implemented its tests. Merlin reproduces the published
-number in our runs: 223.7 tok/s with 2 agents, against 223.9 on the card. The fork is 11–56% ahead with 2–8 agents.
+number in our runs: 223.7 tok/s with 2 agents, against 223.9 on the card. Ours is 11–56% ahead with 2–8 agents.
 Quality is the same: HumanEval 161/164 for both, and MMLU-Pro 236 against 237.
 
 The full table and its caveats are in the
@@ -306,7 +306,7 @@ unlock here. halt95 publishes Merlin's numbers on stock cards, and we'll add tho
 ## Run it yourself
 
 `./setup.sh` checks your machine and shows every download before it starts. It then builds halt95's v2.5.2 with the
-fork's 40 commits on top, verified by commit and tree hash, downloads and verifies the models, and sizes the RAM tier.
+our 40 commits on top, verified by commit and tree hash, downloads and verifies the models, and sizes the RAM tier.
 Afterwards, `bench/check.sh` runs the quick checks. Every benchmark in this post is in `bench/`, so you can compare
 your numbers with ours.
 
@@ -321,7 +321,7 @@ sizes for common RAM amounts.
 - Numbers for stock cards for both builds, measured the way halt95 publishes Merlin's.
 - Fewer guesses for short requests with thinking on, the one test where Merlin is ahead.
 
-If you run the fork, please [open an issue](https://github.com/ththeod/flash-next-swarm-quad3090/issues) with your
+If you try flash-next-swarm-quad3090, please [open an issue](https://github.com/ththeod/flash-next-swarm-quad3090/issues) with your
 board, RAM and numbers. We especially want to hear if they disagree with ours.
 
 ## Thanks
