@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="430" viewBox="0 0 1200 430" role="img" aria-label="Bar chart: 40-agent swarm, completed turns per minute after each step: RAM tier + DFlash 2 + sm_86 kernels 15.94; RAM-tier and scheduling fixes 23.13; FP4 attention KV 23.34; INT8 MoE activations + BF16 unlock 24.24; NCCL LL/Simple protocols 25.73; FlashInfer PCIe all-reduce 26.63.">
-<rect width="1200" height="430" rx="16" fill="#1a1a19"/>
-<rect x="0.5" y="0.5" width="1199" height="429" rx="16" fill="none" stroke="rgba(255,255,255,0.10)"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="456" viewBox="0 0 1200 456" role="img" aria-label="Bar chart: 40-agent swarm, completed turns per minute after each step: RAM tier + DFlash 2 + sm_86 kernels 15.94; RAM-tier and scheduling fixes 23.13; FP4 attention KV 23.34; INT8 MoE activations + BF16 unlock 24.24; NCCL LL/Simple protocols 25.73; FlashInfer PCIe all-reduce 26.63.">
+<rect width="1200" height="456" rx="16" fill="#1a1a19"/>
+<rect x="0.5" y="0.5" width="1199" height="455" rx="16" fill="none" stroke="rgba(255,255,255,0.10)"/>
 <text x="48" y="58" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="22" font-weight="650" fill="#f0efec">40-agent swarm: completed turns per minute, step by step</text>
 <text x="48" y="86" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#c3c2b7">40 agents with ~100K-token contexts for 20 minutes, same benchmark at every step; the BF16 unlock arrived at the INT8 step</text>
 <line x1="360.0" y1="112" x2="360.0" y2="382" stroke="#383835" stroke-width="1"/>
