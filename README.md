@@ -10,9 +10,9 @@
 [Swift 1.5](https://huggingface.co/ukisai/Swift1.5-Qwen3.8-Flash-Next), a post-train of Qwen3.8-Flash-Next (125B MoE),
 tuned for many long conversations at once.
 
-**[Results](#results) · [vs Merlin 3.0.0](#compared-with-merlin-300) · [What it changes](#what-it-changes) · [Quality](#quality) · [Quick start](#quick-start) ·
+**[Results](#results) · [Quick start](#quick-start) · [vs Merlin 3.0.0](#compared-with-merlin-300) · [What it changes](#what-it-changes) · [Quality](#quality) ·
 [Talk to it](#talk-to-it) · [RAM sizing](#ram-sizing) · [Recipe](docs/swarm/recipe.md) ·
-[Blog post: how we did it](https://ththeod.github.io/flash-next-swarm-quad3090/)**
+[Blog post: how it works](https://ththeod.github.io/flash-next-swarm-quad3090/)**
 
 - **Built for swarms.** A RAM KV tier keeps agent conversations warm: in a 40-agent run with ~100K-token contexts, 96%
   of prompt tokens are reloaded from RAM instead of recomputed, and the swarm completes 26.6 turns per minute.
@@ -20,14 +20,13 @@ tuned for many long conversations at once.
 - **Prompts get in fast.** 8,490 tok/s prefill, and a new 20K prompt still runs at 5,400-5,600 tok/s while eight
   80K-context requests are decoding.
 - **Same answers.** Every change passed quality gates before it was kept: HumanEval 161/164 and MMLU-Pro 236/280 at
-  `xhigh`, all needles to 260K, bit-exact resumes from the RAM tier.
+  `xhigh`, all needles to 260K, and identical output when a conversation resumes from RAM.
 - **One command to install.** `./setup.sh` checks your machine, sizes the RAM tier for it, and verifies everything it
   downloads.
 
 **Our version or Merlin 3.0.0?** Our version is built on Flash-Next v2.5.2, the release before halt95's current
 [Merlin 3.0.0](https://github.com/halt95/merlin-engine) (vLLM 0.32, seven checkpoints, many more GPU setups). Use Merlin
 3.0.0 for its checkpoints and hardware range. Use our version to run many coding agents with Swift 1.5 on 4× RTX 3090.
-Porting these changes onto Merlin 3.0.0 is our next step.
 
 ## Results
 
@@ -40,10 +39,9 @@ Porting these changes onto Merlin 3.0.0 is our next step.
 | KV cache | **1,212,416 tokens** in VRAM (262K per request), plus a **130 GiB** RAM tier |
 | Quality, `xhigh`, 64K budget | HumanEval 161/164, MMLU-Pro 236/280, all needles to 260K |
 
-<sub>One machine, 2026-10-22/23, release configuration: ASUS WRX80E-SAGE SE, Threadripper PRO 3955WX, 8×32 GB DDR4-3200,
-4× RTX 3090 with P2P, the optional gpu-unlock active, 1400 MHz clock lock, power caps 265/255/255/240 W (tuned to these
-boards; we recommend 240 W per card for unlocked cards). Generation:
-short prompts, thinking off, 512-token answers. The 80K row is a steady-state window from a different harness, which is
+<sub>One machine, 2026-10-22/23, release configuration: 4× RTX 3090 with P2P, 256 GB RAM, the optional gpu-unlock and a
+1400 MHz clock lock (power settings for your cards: [Hardware tuning](#hardware-tuning-optional)). Generation: short
+prompts, thinking off, 512-token answers. The 80K row is a steady-state window from the long-context probe, which is
 why it reads higher than 8 short requests. Swarm: 40 simulated agents shaped like a real coding-agent harness (MMLU-Pro
 text, thinking off, fixed output lengths), measured for 1,200 s after warm-up; a turn took 76.5 s on average, 52.5 s of
 it queueing for a slot. Prefill: one cold request. These methods differ from those in [README-halt95.md](README-halt95.md)
@@ -52,13 +50,34 @@ for a same-day comparison on this machine. Every run and its spread: [docs/swarm
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/swarm-steps-dark.svg">
-  <img src="docs/images/swarm-steps-light.svg" alt="Bar chart: 40-agent swarm turns per minute after each step of the work: 15.9, 23.1, 23.3, 24.2, 25.7, 26.6" width="100%">
+  <img src="docs/images/swarm-steps-light.svg" alt="Bar chart: what each change added to the 40-agent swarm, in turns per minute: RAM tier, DFlash 2 and small-batch math 15.9; smarter RAM resume and scheduling 23.1 (+7.2); 4-bit KV cache 23.3 (+0.2); 8-bit math and BF16 unlock 24.2 (+0.9); faster GPU traffic with NCCL 25.7 (+1.5); with FlashInfer 26.6 (+0.9)" width="100%">
 </picture>
+
+## Quick start
+
+Needs four RTX 3090s with peer-to-peer, 96 GB of RAM or more and about 160 GB of free disk ([What you need](#what-you-need)).
+
+```bash
+git clone --branch swarm-v1.0 https://github.com/ththeod/flash-next-swarm-quad3090.git && cd flash-next-swarm-quad3090
+./setup.sh            # checks the machine, shows every download with its size, asks once
+scripts/run-swarm.sh  # OpenAI-compatible API on 127.0.0.1:8000
+bench/check.sh        # quick checks against the running server (~10 min)
+```
+
+`setup.sh` runs halt95's v2.5.2 build script unchanged and then our changes on top, both verified by commit and tree
+hash. It downloads the checkpoint and the drafter at pinned revisions, checks them against pinned SHA-256 lists, sizes
+the RAM tier for your machine and writes `config/local.env`. Useful options: `--ckpt DIR` reuses a checkpoint you
+already have, `--host 0.0.0.0` serves your network with a generated API key, `--systemd` installs the service,
+`--build-own` compiles the engine extensions on older systems, and `--dry-run` shows the plan without changing
+anything. `scripts/gpu-status.sh` shows the cards, peer-to-peer, power caps, the clock lock and the BF16 unlock. The
+first start takes about 10 minutes while the server compiles its GPU code; later starts take about 5.5.
+
+Every step by hand, plus BIOS settings and the P2P driver: [docs/swarm/recipe.md](docs/swarm/recipe.md).
 
 ## Compared with Merlin 3.0.0
 
 halt95's current release and our version, on the same machine on the same day (2026-10-23), with the same settings
-(gpu-unlock active, 1400 MHz lock, our caps) and the same benchmarks. Merlin 3.0.0 ran as its own launcher sets it up
+(gpu-unlock active, 1400 MHz lock) and the same benchmarks. Merlin 3.0.0 ran as its own launcher sets it up
 for this checkpoint (`models/swift1.5/serve.sh`, profile fn-swift1.5-quad-3090: MTP K=3, FP8 KV, 8 requests at once,
 no RAM tier). Both columns are single same-day runs (medians of three sends where a test sends three).
 
@@ -96,26 +115,26 @@ conversations instead of 16K (a bug in our script, since fixed); its 2-agent fig
 (223.7 vs 223.9 tok/s). A decode-ladder cell at 131K is left out until both builds have run with the fixed script.
 Stock-card (no unlock) numbers for both builds, the way halt95 publishes Merlin, will be added.</sub>
 
-**Where Merlin is ahead:** a single request with thinking on at short context, by about 7% (MTP with 3 drafts suits
-short reasoning text better than our 7-draft DFlash schedule). Everywhere else, and above all with many long
+**Where Merlin is ahead:** a single request with thinking on at short context, by about 7%. Thinking text is harder to
+guess than code, and Merlin's 3 guesses per step most likely waste less work there than our 7. Everywhere else, and above all with many long
 conversations, our version is ahead, at the same quality.
 
 ## What it changes
 
 40 commits on halt95's v2.5.2, one change each, with its measurement in the commit message
-(`release/swarm-v1.0/patches/0099..0138`). How each was found and measured: [the blog post](https://ththeod.github.io/flash-next-swarm-quad3090/).
+(`release/swarm-v1.0/patches/0099..0138`). Why each one works, in plain terms:
+[the blog post](https://ththeod.github.io/flash-next-swarm-quad3090/#how-it-works).
 
-| Area | Change | Effect |
+| Area | What changed | Effect |
 |---|---|---|
-| RAM KV tier | vLLM's CPU KV offloading made to work with this hybrid model, whose DeltaNet layers carry a recurrent state: one offload stride on both pipeline stages, resume at the previous turn's end, fences for in-flight stores, ARC eviction, each per-layer cache stored once | agent follow-ups reload from RAM instead of recomputing (~4K computed tokens per turn instead of ~15K) |
-| Speculative decoding | the [DFlash 2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) drafter instead of MTP: 7 drafts for one request, 3 for 2-8, 2 for 9-16 | 3.4-3.6 tokens accepted per step instead of 3.1; one request +53% on code |
-| KV pool | FP4 attention KV with dedicated sm_86 kernels | 26-28% more tokens than FP8, at FP8 speed |
-| MoE activations | INT8 activations for the INT4 experts (W4A8 Marlin), two Marlin bugs fixed | prefill +11-12% on stock cards; small quality cost ([Quality](#quality)) |
-| Decode kernels | a skinny GEMM for sm_86, small-batch MoE routing, sparse logits, an INT8 draft head, a top-k-first sampler | one request 242 → 297 tok/s on our code prompt |
-| Pipeline | decode micro-batches balanced across the two stages | +34% at 16 requests |
-| Communication | custom all-reduce only within one PCIe root complex; NCCL LL for small and Simple for large messages; vLLM's FlashInfer PCIe IPC all-reduce, switched on with FlashInfer 0.7 as halt95 does in Merlin 3.0.0 | a new prompt no longer stalls running decodes; +9-11% generation at 8-16 requests |
-| Scheduling | a deferred RAM lookup keeps its place in the queue; Mamba-state checkpoints kept only while requests queue | no mid-answer stalls under a swarm |
-| Stability | NaN-draft guard, a pipeline crash on one-token chunks, a KV-copy OOM, a torch.compile deadlock with the RAM tier | 0 errors in our swarm runs |
+| **Conversations stay in RAM** (RAM KV tier) | vLLM's CPU KV offloading made to work with this hybrid model: the DeltaNet layers' running state is saved at the end of every turn, and the next turn resumes from it. ARC eviction keeps long-lived parent conversations from being pushed out by bursts of short subagents. | 96% of a swarm's prompt tokens come back from RAM; about 4K tokens are recomputed per agent turn |
+| **Better guesses** (speculative decoding) | the [DFlash 2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) drafter instead of MTP: 7 guesses for one request, 3 for 2–8, 2 for 9–16 | 3.4–3.6 tokens accepted per step instead of 3.1; one request +53% on code |
+| **More room** (KV cache) | 4-bit (FP4) attention KV, with attention kernels written for it, and a separate small cache for the drafter | 26–28% more tokens than 8-bit at the same speed: 1.21M tokens in VRAM |
+| **8-bit math** (MoE activations) | the expert layers' inputs converted to INT8 (W4A8 Marlin), which GeForce runs at full rate; vLLM's INT8 path made to work with this checkpoint | prefill +11–12% on stock cards; a small cost on code ([Quality](#quality)) |
+| **Less wasted work per step** (decode kernels) | matrix code sized for small batches on sm_86, small-batch MoE kernels, a cheaper next-token step | one request +23% |
+| **Even groups on the assembly line** (pipeline) | equal decode micro-batches on the two pipeline stages | +34% at 16 requests |
+| **Faster GPU traffic** (communication) | the custom all-reduce only between GPUs on the same PCIe root complex and for small messages; NCCL for large ones (`NCCL_PROTO=LL,Simple`); FlashInfer 0.7's PCIe all-reduce, as in Merlin 3.0.0 | a new 20K prompt next to eight 80K decodes is done in 3.6 s while they keep generating; +9–11% generation at 8–16 requests |
+| **Fair queueing** (scheduling) | a request waiting for its RAM lookup keeps its place in line; extra saved states are dropped while memory is short | no mid-answer stalls in a full swarm |
 
 ## Quality
 
@@ -128,28 +147,10 @@ quality evals at `xhigh` reasoning with a 64K budget.
 | MMLU-Pro, 280 questions | 236/280; BF16 activations 239, FP8 KV 232 (run-to-run noise about ±4) |
 | Needles, 10K to 260K | all found |
 | INT8 vs BF16 activations, teacher-forced perplexity on 64K documents | code +0.9% / +1.5%, prose ±0.04% |
-| RAM-tier resume vs GPU-cache resume, greedy | bit-exact |
+| Conversation resumed from RAM vs from GPU memory, greedy | identical output |
 
 INT8 activations cost a little on code perplexity and nothing measurable on the evals. `VLLM_MARLIN_INPUT_DTYPE=` (empty)
 in `config/local.env` restores BF16.
-
-## Quick start
-
-```bash
-git clone --branch swarm-v1.0 https://github.com/ththeod/flash-next-swarm-quad3090.git && cd flash-next-swarm-quad3090
-./setup.sh            # checks the machine, shows every download with its size, asks once
-scripts/run-swarm.sh  # OpenAI-compatible API on 127.0.0.1:8000
-bench/check.sh        # quick checks against the running server (~10 min)
-```
-
-`setup.sh` runs halt95's v2.5.2 build script unchanged and then our changes on top, both verified by commit and tree
-hash. It downloads the checkpoint and the drafter at pinned revisions, checks them against pinned SHA-256 lists, sizes
-the RAM tier for your machine and writes `config/local.env`. Useful options: `--ckpt DIR` reuses a checkpoint you
-already have, `--host 0.0.0.0` serves your network with a generated API key, `--systemd` installs the service,
-`--build-own` compiles the engine extensions on older systems, and `--dry-run` shows the plan without changing
-anything. `scripts/gpu-status.sh` shows the cards, peer-to-peer, power caps, the clock lock and the BF16 unlock.
-
-Every step by hand, plus BIOS settings and the P2P driver: [docs/swarm/recipe.md](docs/swarm/recipe.md).
 
 ## Talk to it
 
@@ -163,7 +164,7 @@ curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/jso
 }'
 ```
 
-- **Reasoning.** Thinking is on by default with `reasoning_effort` `"low"`, as on the reference host. Ask for `"high"` or
+- **Reasoning.** Thinking is on by default with `reasoning_effort` `"low"`. Ask for `"high"` or
   `"xhigh"` per request as above, or turn it off with `"enable_thinking": false`. `REASONING_EFFORT=xhigh` in
   `config/local.env` changes the server default; halt95's recipes default to `xhigh`, and our quality numbers use it.
 - **Network.** `./setup.sh --host 0.0.0.0` serves your LAN and writes an API key to `config/local.env`; clients send
@@ -203,13 +204,13 @@ Only the 256 GB row is measured so far. Details, and what a 64 GB machine would 
 
 GeForce Ampere runs BF16/FP16 tensor math with FP32 accumulate at half the workstation rate. Zagitta's
 [gpu-unlock](https://github.com/Zagitta/gpu-unlock) module (not part of this project; use only this URL) lifts
-that limit. It is volatile and needs a cold power cycle. On the same build it added 8-9% prefill, which then became
-power-bound. How we set it up, check it and undo it: [docs/swarm/gpu-unlock.md](docs/swarm/gpu-unlock.md).
+that limit. It is volatile and needs a cold power cycle. On the same build it added 8–9% prefill, which then became
+power-bound. How to set it up, check it and undo it: [docs/swarm/gpu-unlock.md](docs/swarm/gpu-unlock.md).
 
-**Unlocked cards need a clock lock.** With unlocked cards our 1500 W PSU tripped (whole machine off) at a 1650 MHz lock,
-and again at 1455 MHz about a minute into a step test, at the start of a 4-card BF16 burst. Power caps react too slowly
-to stop that spike; the clock lock contains it, and 1400 MHz has run for days. For unlocked cards we recommend 240 W per
-card with the 1400 MHz lock; for stock cards, halt95's 220 W and no lock. `scripts/run-swarm.sh` refuses to start on
+**Unlocked cards need a clock lock.** They draw short power spikes at the start of each burst of work, and these can
+trip a power supply even when the average draw is well within its rating. Power caps react too slowly to stop them; a
+clock lock contains them. For unlocked cards we recommend 240 W per card with a 1400 MHz lock; for stock cards,
+halt95's 220 W and no lock. `scripts/run-swarm.sh` refuses to start on
 unlocked cards without the lock. Details: [docs/swarm/power-and-clocks.md](docs/swarm/power-and-clocks.md).
 
 ## Known limitations
@@ -227,8 +228,8 @@ unlocked cards without the lock. Details: [docs/swarm/power-and-clocks.md](docs/
 - `MemorySwapMax=0`, which keeps the n-gram table out of swap, applies when the server runs as the systemd service, not
   when you start `scripts/run-swarm.sh` by hand on a machine with swap.
 - Image input is enabled as in halt95's release but was not part of our tests with the RAM tier and DFlash 2.
-- Tested on one machine, with peer-to-peer: ASUS Pro WS WRX80E-SAGE SE, Threadripper PRO 3955WX, 8×32 GB DDR4-3200,
-  4× RTX 3090 (Gigabyte ×2, ZOTAC, Founders Edition), be quiet! Dark Power Pro 12 1500 W in single-rail mode.
+- Tested on one machine so far, with peer-to-peer. Boards differ in PCIe layout and power delivery, so your numbers may
+  differ; reports are welcome as [issues](https://github.com/ththeod/flash-next-swarm-quad3090/issues).
 
 More, including what we tried and dropped: [docs/swarm/troubleshooting.md](docs/swarm/troubleshooting.md).
 
