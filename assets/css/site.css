@@ -80,6 +80,20 @@ a:hover { text-decoration-thickness: 2px; }
   font: 0.86em/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
+/* Code blocks (kramdown + rouge wrap them in div.highlighter-rouge > div.highlight > pre). */
+.post pre {
+  margin: 0 0 20px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  scrollbar-color: var(--line) transparent;
+}
+.post pre code { padding: 0; background: none; border: 0; font: inherit; }
+.post .highlight .c, .post .highlight .c1 { color: var(--muted); }
+
 /* Charts break out of the text column so their labels stay readable. */
 .post picture {
   display: block;
@@ -96,6 +110,7 @@ a:hover { text-decoration-thickness: 2px; }
   font-size: 15px;
   line-height: 1.45;
   font-variant-numeric: tabular-nums;
+  scrollbar-color: var(--line) transparent;
 }
 .post th, .post td { padding: 9px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
 .post th:first-child, .post td:first-child { padding-left: 0; }
