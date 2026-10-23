@@ -7,6 +7,13 @@
   --line: #e1e0d9;
   --soft: #f3f2ee;
   --accent: #1f6bc4;
+  --series: #2a78d6;
+  --series-tint: #bfd5f1;
+  --merlin: #eb6834;
+  --down: #e34948;
+  --grid: #e8e7e1;
+  --base: #a9a79f;
+  --tile: #f3f2ee;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
@@ -18,6 +25,13 @@
     --line: #2f2f2d;
     --soft: #242423;
     --accent: #5a9ded;
+    --series: #3987e5;
+    --series-tint: #29456a;
+    --merlin: #d95926;
+    --down: #e66767;
+    --grid: #2c2c2a;
+    --base: #5f5e59;
+    --tile: #222221;
     color-scheme: dark;
   }
 }
@@ -96,7 +110,7 @@ a:hover { text-decoration-thickness: 2px; }
 
 /* An embedded GIF: centered, scales down on phones, keeps its aspect ratio. */
 .post figure.gif { max-width: 480px; margin: 28px auto 32px; }
-.post figure.gif iframe { display: block; width: 100%; aspect-ratio: 480 / 259; border: 0; border-radius: 12px; }
+.post figure.gif img { display: block; width: 100%; height: auto; border-radius: 12px; }
 .post figure.gif figcaption { margin-top: 8px; color: var(--muted); font-size: 14px; text-align: center; }
 
 /* Charts break out of the text column so their labels stay readable. */
@@ -125,11 +139,140 @@ a:hover { text-decoration-thickness: 2px; }
 .site-footer .bar { padding: 22px 16px 36px; }
 .site-footer a { color: var(--text2); }
 
+/* Charts: HTML bars that grow in when scrolled into view (assets/js/charts.js adds .in-view). Without JS, or with
+   reduced motion, they render in their final state. */
+.post figure.chart {
+  width: min(1040px, calc(100vw - 32px));
+  margin: 32px 0 32px 50%;
+  transform: translateX(-50%);
+  padding: 26px 32px 20px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+}
+.chart-head { display: block; margin-bottom: 18px; }
+.chart-title { display: block; color: var(--text); font-size: 19px; font-weight: 650; letter-spacing: -0.01em; }
+.chart-sub { display: block; margin-top: 4px; color: var(--text2); font-size: 14px; line-height: 1.45; }
+.legend { display: flex; flex-wrap: wrap; gap: 18px; margin: -4px 0 14px; color: var(--text2); font-size: 13px; }
+.legend .sw { display: inline-block; width: 12px; height: 12px; margin-right: 6px; border-radius: 3px; vertical-align: -1px; }
+.sw.tint { background: var(--series-tint); }
+.sw.solid { background: var(--series); }
+
+.chart .row {
+  display: grid;
+  grid-template-columns: var(--lw, 280px) 1fr;
+  column-gap: 16px;
+  align-items: center;
+  padding: 5px 0;
+  outline: none;
+}
+.chart .label { color: var(--text2); font-size: 14px; line-height: 1.3; text-align: right; }
+.chart .track { position: relative; height: 22px; }
+.chart .rows.tall .track { height: 30px; }
+.chart .gl { position: absolute; top: -5px; bottom: -5px; width: 1px; background: var(--grid); }
+.chart .gl.base { background: var(--base); }
+.chart .seg {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 0 4px 4px 0;
+  transform-origin: left center;
+  transition: transform 900ms cubic-bezier(0.2, 0.8, 0.2, 1) calc(var(--i) * 70ms), opacity 150ms ease;
+}
+.chart .seg.solid, .chart .seg.ours, .chart .seg.up { background: var(--series); }
+.chart .seg.tint { background: var(--series-tint); border-radius: 0; }
+.chart .seg.merlin { background: var(--merlin); }
+.chart .seg.down { background: var(--down); border-radius: 4px 0 0 4px; transform-origin: right center; }
+.chart .val {
+  position: absolute;
+  top: 50%;
+  margin-left: 10px;
+  transform: translateY(-50%);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  transition: opacity 400ms ease calc(var(--i) * 70ms + 550ms);
+}
+.chart .gain { margin-left: 8px; color: var(--text2); font-size: 13px; font-weight: 500; }
+.chart .callout {
+  margin-left: 10px;
+  padding: 2px 9px;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 650;
+}
+.chart .axis { position: relative; height: 40px; margin: 8px 0 0 calc(var(--lw, 280px) + 16px); }
+.chart .tick { position: absolute; top: 0; transform: translateX(-50%); color: var(--muted); font-size: 12px; }
+.chart .axis-title {
+  position: absolute;
+  top: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.chart .rows:hover .row:not(:hover) .seg,
+.chart .rows:focus-within .row:not(:focus) .seg { opacity: 0.45; }
+.chart .row:focus-visible .label { color: var(--text); text-decoration: underline; text-underline-offset: 3px; }
+.js .chart:not(.in-view) .seg { transform: scaleX(0); }
+.js .chart:not(.in-view) .val { opacity: 0; }
+
+.post figure.hero { padding: 18px; }
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+.kpi {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 16px 18px;
+  background: var(--tile);
+  border-radius: 12px;
+  transition: opacity 600ms ease calc(var(--i) * 90ms), transform 700ms cubic-bezier(0.2, 0.8, 0.2, 1) calc(var(--i) * 90ms);
+}
+.kpi::before { content: ""; width: 22px; height: 3px; margin-bottom: 8px; background: var(--series); border-radius: 2px; }
+.kpi-label { color: var(--text2); font-size: 14px; }
+.kpi-value { color: var(--text); font-size: 40px; font-weight: 700; line-height: 1.1; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.kpi-unit { color: var(--muted); font-size: 13px; }
+.js .hero:not(.in-view) .kpi { opacity: 0; transform: translateY(10px); }
+
+.chart-tip {
+  position: fixed;
+  z-index: 10;
+  padding: 8px 11px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
+  font-size: 13px;
+  line-height: 1.35;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.chart-tip.on { opacity: 1; }
+.chart-tip b { display: block; color: var(--text); font-size: 15px; font-weight: 650; }
+.chart-tip span { color: var(--text2); }
+
+@media (prefers-reduced-motion: reduce) {
+  .chart .seg, .chart .val, .kpi { transition: none !important; }
+}
+
 @media (max-width: 640px) {
   body { font-size: 16px; }
   .post { padding-top: 32px; }
   .post h2 { margin-top: 48px; font-size: 23px; }
   .post h3 { font-size: 19px; }
   .post table { display: block; overflow-x: auto; font-size: 14px; }
+  .post figure.chart { padding: 18px 16px 14px; }
+  .chart .row { grid-template-columns: 1fr; row-gap: 4px; }
+  .chart .label { text-align: left; }
+  .chart .axis { margin-left: 0; }
+  .chart .callout { display: none; }
+  .kpis { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .kpi { padding: 12px 14px; }
+  .kpi-value { font-size: 30px; }
   .post th, .post td { padding: 8px 8px; }
 }

@@ -4,6 +4,11 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
+  <script>
+    // Charts start hidden only when charts.js is going to animate them; if it never runs, show them after 3 s.
+    document.documentElement.classList.add('js');
+    setTimeout(function () { if (!window.chartsReady) document.documentElement.classList.remove('js'); }, 3000);
+  </script>
   {% seo %}
   <link rel="stylesheet" href="{{ '/assets/css/site.css' | relative_url }}">
 </head>
@@ -25,5 +30,6 @@
       <a href="{{ site.repo }}">{{ site.title }}</a>
     </div>
   </footer>
+  <script src="{{ '/assets/js/charts.js' | relative_url }}" defer></script>
 </body>
 </html>

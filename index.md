@@ -8,10 +8,7 @@ title: "Four RTX 3090s, one 125B MoE, forty coding agents"
 *flash-next-swarm-quad3090: coding-agent swarms on consumer GPUs without giving up quality, built on halt95's Flash-Next engine. ththeod, October 2026.
 Code, patches and benchmarks: [github.com/ththeod/flash-next-swarm-quad3090](https://github.com/ththeod/flash-next-swarm-quad3090)*
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/hero-dark.svg">
-  <img src="assets/hero-light.svg" alt="1,144 tok/s at 16 requests; 8,490 tok/s prefill; 1.21M-token KV cache plus a RAM tier; 26.6 turns per minute with 40 agents" width="100%">
-</picture>
+{% include chart-hero.html %}
 
 A coding-agent harness can fan out into dozens of subagents, each carrying a conversation of 100K tokens or more.
 Every turn resends the whole conversation, so a server is only fast if it still has the earlier part cached.
@@ -42,7 +39,7 @@ conversations, subagents and tool calls run for 20 minutes, shaped after a real 
 per minute.
 
 <figure class="gif">
-  <iframe src="https://giphy.com/embed/mPOGx4hJtOWSA" title="A huge crowd of cheering Minions" frameborder="0" loading="lazy" allowfullscreen></iframe>
+  <img src="https://media.giphy.com/media/mPOGx4hJtOWSA/giphy.gif" alt="A huge crowd of cheering Minions" width="480" height="259">
   <figcaption>The swarm benchmark, artist's impression · <a href="https://giphy.com/gifs/despicable-me-minions-cute-mPOGx4hJtOWSA">via GIPHY</a></figcaption>
 </figure>
 
@@ -63,19 +60,13 @@ We ran halt95's current release next to ours on the same hardware, on the same d
 used its own launcher for this model: the built-in drafter, which guesses 3 tokens ahead, an 8-bit KV cache and at
 most 8 requests at once. These are that day's numbers for both builds, so ours differ from the table above.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/vs-merlin-swarm-dark.svg">
-  <img src="assets/vs-merlin-swarm-light.svg" alt="40-agent swarm, turns per minute: flash-next-swarm-quad3090 26.5, Merlin 3.0.0 4.2" width="100%">
-</picture>
+{% include chart-swarm.html %}
 
 Merlin's cache holds fewer than ten of the forty conversations, so it recomputes 99% of every prompt, and requests
 wait 425 seconds on average for a slot. Ours recomputes 4%, and requests wait 52 seconds. To be fair to Merlin, it
 doesn't claim to serve this workload: its own bench card measures eight agents with 16K-token conversations.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/vs-merlin-dark.svg">
-  <img src="assets/vs-merlin-light.svg" alt="Ours relative to Merlin 3.0.0: 16 requests 2.02x, 1 request short prompt 1.92x, 8 requests 1.30x, 8 at 80K 1.22x, 1 after 260K 1.14x, 8 agents 1.11x, prefill 50K 1.11x, prefill 260K 1.10x, 1 request thinking on at 4K 0.93x" width="100%">
-</picture>
+{% include chart-ratios.html %}
 
 On the smaller tests, ours is ahead by 10–30%, and by about 2× at 16 requests, where Merlin serves 8 at a time and the
 rest wait. A single short request is 1.9× faster too.
@@ -194,10 +185,7 @@ code (see [Quality](#quality)).
 
 ### Adding it up
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/swarm-steps-dark.svg">
-  <img src="assets/swarm-steps-light.svg" alt="Bar chart: 40-agent swarm turns per minute after each group of changes: RAM tier, DFlash 2 and small-batch math 15.9; smarter RAM resume and scheduling 23.1; 4-bit KV cache 23.3; 8-bit math and BF16 unlock 24.2; faster GPU traffic with NCCL 25.7; faster GPU traffic with FlashInfer 26.6" width="100%">
-</picture>
+{% include chart-steps.html %}
 
 The chart shows the swarm benchmark after each group of changes, in the order we made them. Power settings changed
 along the way, so read it as a rough guide.
