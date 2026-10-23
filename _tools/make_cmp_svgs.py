@@ -6,9 +6,9 @@ OUT = sys.argv[1]
 FONT = 'system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif'
 T = {
     "light": dict(surface="#fcfcfb", text="#0b0b0b", text2="#52514e", muted="#898781", grid="#e1e0d9", base="#898781",
-                  border="rgba(11,11,11,0.10)", up="#2a78d6", down="#e34948", merlin="#eb6834"),
+                  border="rgba(11,11,11,0.10)", up="#2a78d6", down="#e34948", merlin="#eb6834", pill="#f3f2ee"),
     "dark": dict(surface="#1a1a19", text="#f0efec", text2="#c3c2b7", muted="#898781", grid="#2c2c2a", base="#898781",
-                 border="rgba(255,255,255,0.10)", up="#3987e5", down="#e66767", merlin="#d95926"),
+                 border="rgba(255,255,255,0.10)", up="#3987e5", down="#e66767", merlin="#d95926", pill="#242423"),
 }
 RATIOS = [  # (label, ours, merlin)
     ("Generation, 16 requests", 1124.0, 556.8),
@@ -71,7 +71,7 @@ def swarm_chart(t):
     W, H = 1200, 300
     rows = [("flash-next-swarm-quad3090", 26.48, t["up"]), ("Merlin 3.0.0", 4.15, t["merlin"])]
     L, R, T0, row, bar = 300, 1110, 122, 56, 24
-    sx = lambda v: L + (R - L) * v / 30.0
+    sx = lambda v: L + (R - L) * v / 33.0   # headroom for the value and the pill
     label = "40-agent swarm, turns per minute, same machine and day: ours 26.5, Merlin 3.0.0 4.2"
     o = frame(t, W, H, "40-agent swarm: completed turns per minute", "40 agents with ~100K-token contexts for 20 minutes, same machine and day; Merlin recomputes 99% of each prompt, ours 4%", label)
     yb = T0 + len(rows) * row
@@ -85,6 +85,10 @@ def swarm_chart(t):
         o.append(f'<path d="{d}" fill="{col}"><title>{esc(name)}: {v:.2f} turns/min</title></path>')
         o.append(f'<text x="{L-14}" y="{y+bar/2+5}" text-anchor="end" font-family=\'{FONT}\' font-size="15" fill="{t["text2"]}">{esc(name)}</text>')
         o.append(f'<text x="{x2+10:.1f}" y="{y+bar/2+5}" font-family=\'{FONT}\' font-size="15" font-weight="600" fill="{t["text"]}">{v:.1f}</text>')
+        if i == 0:   # the ratio, as a pill after our value (the blog chart shows the same)
+            px = x2 + 56
+            o.append(f'<rect x="{px:.1f}" y="{y+bar/2-12}" width="52" height="24" rx="12" fill="{t["pill"]}" stroke="{t["border"]}"/>')
+            o.append(f'<text x="{px+26:.1f}" y="{y+bar/2+5}" text-anchor="middle" font-family=\'{FONT}\' font-size="13" font-weight="650" fill="{t["text"]}">{rows[0][1] / rows[1][1]:.1f}×</text>')
     o.append(f'<text x="{(L+R)/2:.0f}" y="{yb+46}" text-anchor="middle" font-family=\'{FONT}\' font-size="13" fill="{t["muted"]}">turns per minute</text>')
     o.append('</svg>')
     return "\n".join(o)

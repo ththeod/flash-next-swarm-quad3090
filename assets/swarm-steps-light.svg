@@ -1,33 +1,42 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="456" viewBox="0 0 1200 456" role="img" aria-label="Bar chart: 40-agent swarm, completed turns per minute after each step: RAM tier, DFlash 2, small-batch math 15.94; Smarter RAM resume and scheduling 23.13; 4-bit KV cache 23.34; 8-bit math + BF16 unlock 24.24; Faster GPU traffic: NCCL 25.73; Faster GPU traffic: FlashInfer 26.63.">
-<rect width="1200" height="456" rx="16" fill="#fcfcfb"/>
-<rect x="0.5" y="0.5" width="1199" height="455" rx="16" fill="none" stroke="rgba(11,11,11,0.10)"/>
-<text x="48" y="58" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="22" font-weight="650" fill="#0b0b0b">What each change added: 40-agent swarm, turns per minute</text>
-<text x="48" y="86" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">40 agents with ~100K-token conversations for 20 minutes, same benchmark at every step; the BF16 unlock came with 8-bit math</text>
-<line x1="360.0" y1="112" x2="360.0" y2="382" stroke="#c3c2b7" stroke-width="1"/>
-<text x="360.0" y="404" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">0</text>
-<line x1="610.0" y1="112" x2="610.0" y2="382" stroke="#e1e0d9" stroke-width="1"/>
-<text x="610.0" y="404" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">10</text>
-<line x1="860.0" y1="112" x2="860.0" y2="382" stroke="#e1e0d9" stroke-width="1"/>
-<text x="860.0" y="404" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">20</text>
-<line x1="1110.0" y1="112" x2="1110.0" y2="382" stroke="#e1e0d9" stroke-width="1"/>
-<text x="1110.0" y="404" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">30</text>
-<path d="M360,129.0 H754.5 Q758.5,129.0 758.5,133.0 V147.0 Q758.5,151.0 754.5,151.0 H360 Z" fill="#2a78d6"><title>RAM tier, DFlash 2, small-batch math: 15.94 turns/min</title></path>
-<text x="346" y="145.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">RAM tier, DFlash 2, small-batch math</text>
-<text x="768.5" y="145.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">15.9</text>
-<path d="M360,173.0 H934.2 Q938.2,173.0 938.2,177.0 V191.0 Q938.2,195.0 934.2,195.0 H360 Z" fill="#2a78d6"><title>Smarter RAM resume and scheduling: 23.13 turns/min</title></path>
-<text x="346" y="189.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">Smarter RAM resume and scheduling</text>
-<text x="948.2" y="189.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">23.1</text>
-<path d="M360,217.0 H939.5 Q943.5,217.0 943.5,221.0 V235.0 Q943.5,239.0 939.5,239.0 H360 Z" fill="#2a78d6"><title>4-bit KV cache: 23.34 turns/min</title></path>
-<text x="346" y="233.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">4-bit KV cache</text>
-<text x="953.5" y="233.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">23.3</text>
-<path d="M360,261.0 H962.0 Q966.0,261.0 966.0,265.0 V279.0 Q966.0,283.0 962.0,283.0 H360 Z" fill="#2a78d6"><title>8-bit math + BF16 unlock: 24.24 turns/min</title></path>
-<text x="346" y="277.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">8-bit math + BF16 unlock</text>
-<text x="976.0" y="277.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">24.2</text>
-<path d="M360,305.0 H999.2 Q1003.2,305.0 1003.2,309.0 V323.0 Q1003.2,327.0 999.2,327.0 H360 Z" fill="#2a78d6"><title>Faster GPU traffic: NCCL: 25.73 turns/min</title></path>
-<text x="346" y="321.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">Faster GPU traffic: NCCL</text>
-<text x="1013.2" y="321.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">25.7</text>
-<path d="M360,349.0 H1021.8 Q1025.8,349.0 1025.8,353.0 V367.0 Q1025.8,371.0 1021.8,371.0 H360 Z" fill="#2a78d6"><title>Faster GPU traffic: FlashInfer: 26.63 turns/min</title></path>
-<text x="346" y="365.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">Faster GPU traffic: FlashInfer</text>
-<text x="1035.8" y="365.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">26.6</text>
-<text x="735" y="430" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">turns per minute</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="480" viewBox="0 0 1200 480" role="img" aria-label="Bar chart: 40-agent swarm, completed turns per minute after each group of changes: RAM tier, DFlash 2, small-batch math 15.94; Smarter RAM resume and scheduling 23.13; 4-bit KV cache 23.34; 8-bit math + BF16 unlock 24.24; Faster GPU traffic: NCCL 25.73; Faster GPU traffic: FlashInfer 26.63.">
+<rect width="1200" height="480" rx="16" fill="#fcfcfb"/>
+<rect x="0.5" y="0.5" width="1199" height="479" rx="16" fill="none" stroke="rgba(11,11,11,0.10)"/>
+<text x="48" y="58" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="22" font-weight="650" fill="#0b0b0b">What each change added</text>
+<text x="48" y="86" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">40-agent swarm with ~100K-token conversations, 20 minutes per run; the BF16 unlock came with the 8-bit math</text>
+<rect x="48" y="103" width="12" height="12" rx="3" fill="#bfd5f1"/>
+<text x="66" y="114" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#52514e">before this change</text>
+<rect x="238" y="103" width="12" height="12" rx="3" fill="#2a78d6"/>
+<text x="256" y="114" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#52514e">added by this change</text>
+<line x1="360.0" y1="136" x2="360.0" y2="406" stroke="#c3c2b7" stroke-width="1"/>
+<text x="360.0" y="428" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">0</text>
+<line x1="610.0" y1="136" x2="610.0" y2="406" stroke="#e1e0d9" stroke-width="1"/>
+<text x="610.0" y="428" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">10</text>
+<line x1="860.0" y1="136" x2="860.0" y2="406" stroke="#e1e0d9" stroke-width="1"/>
+<text x="860.0" y="428" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">20</text>
+<line x1="1110.0" y1="136" x2="1110.0" y2="406" stroke="#e1e0d9" stroke-width="1"/>
+<text x="1110.0" y="428" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">30</text>
+<path d="M360.0,153.0 H754.5 Q758.5,153.0 758.5,157.0 V171.0 Q758.5,175.0 754.5,175.0 H360.0 Z" fill="#2a78d6"><title>RAM tier, DFlash 2, small-batch math: 15.94 turns/min</title></path>
+<text x="346" y="169.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">RAM tier, DFlash 2, small-batch math</text>
+<text x="768.5" y="169.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15"><tspan font-weight="600" fill="#0b0b0b">15.9</tspan></text>
+<rect x="360" y="197.0" width="398.5" height="22" fill="#bfd5f1"/>
+<path d="M760.5,197.0 H934.2 Q938.2,197.0 938.2,201.0 V215.0 Q938.2,219.0 934.2,219.0 H760.5 Z" fill="#2a78d6"><title>Smarter RAM resume and scheduling: 23.13 turns/min (+7.2)</title></path>
+<text x="346" y="213.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">Smarter RAM resume and scheduling</text>
+<text x="948.2" y="213.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15"><tspan font-weight="600" fill="#0b0b0b">23.1</tspan><tspan dx="8" font-size="13" fill="#52514e">+7.2</tspan></text>
+<rect x="360" y="241.0" width="578.2" height="22" fill="#bfd5f1"/>
+<path d="M940.2,241.0 H941.9 Q943.5,241.0 943.5,242.625 V261.375 Q943.5,263.0 941.9,263.0 H940.2 Z" fill="#2a78d6"><title>4-bit KV cache: 23.34 turns/min (+0.2)</title></path>
+<text x="346" y="257.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">4-bit KV cache</text>
+<text x="953.5" y="257.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15"><tspan font-weight="600" fill="#0b0b0b">23.3</tspan><tspan dx="8" font-size="13" fill="#52514e">+0.2</tspan></text>
+<rect x="360" y="285.0" width="583.5" height="22" fill="#bfd5f1"/>
+<path d="M945.5,285.0 H962.0 Q966.0,285.0 966.0,289.0 V303.0 Q966.0,307.0 962.0,307.0 H945.5 Z" fill="#2a78d6"><title>8-bit math + BF16 unlock: 24.24 turns/min (+0.9)</title></path>
+<text x="346" y="301.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">8-bit math + BF16 unlock</text>
+<text x="976.0" y="301.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15"><tspan font-weight="600" fill="#0b0b0b">24.2</tspan><tspan dx="8" font-size="13" fill="#52514e">+0.9</tspan></text>
+<rect x="360" y="329.0" width="606.0" height="22" fill="#bfd5f1"/>
+<path d="M968.0,329.0 H999.2 Q1003.2,329.0 1003.2,333.0 V347.0 Q1003.2,351.0 999.2,351.0 H968.0 Z" fill="#2a78d6"><title>Faster GPU traffic: NCCL: 25.73 turns/min (+1.5)</title></path>
+<text x="346" y="345.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">Faster GPU traffic: NCCL</text>
+<text x="1013.2" y="345.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15"><tspan font-weight="600" fill="#0b0b0b">25.7</tspan><tspan dx="8" font-size="13" fill="#52514e">+1.5</tspan></text>
+<rect x="360" y="373.0" width="643.2" height="22" fill="#bfd5f1"/>
+<path d="M1005.2,373.0 H1021.8 Q1025.8,373.0 1025.8,377.0 V391.0 Q1025.8,395.0 1021.8,395.0 H1005.2 Z" fill="#2a78d6"><title>Faster GPU traffic: FlashInfer: 26.63 turns/min (+0.9)</title></path>
+<text x="346" y="389.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">Faster GPU traffic: FlashInfer</text>
+<text x="1035.8" y="389.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15"><tspan font-weight="600" fill="#0b0b0b">26.6</tspan><tspan dx="8" font-size="13" fill="#52514e">+0.9</tspan></text>
+<text x="735" y="454" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">completed turns per minute</text>
 </svg>
