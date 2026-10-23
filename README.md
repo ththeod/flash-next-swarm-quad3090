@@ -10,7 +10,7 @@
 [Swift 1.5](https://huggingface.co/ukisai/Swift1.5-Qwen3.8-Flash-Next), a post-train of Qwen3.8-Flash-Next (125B MoE),
 tuned for many long conversations at once.
 
-**[Results](#results) · [What it changes](#what-this-fork-changes) · [Quality](#quality) · [Quick start](#quick-start) ·
+**[Results](#results) · [vs Merlin 3.0.0](#compared-with-merlin-300) · [What it changes](#what-this-fork-changes) · [Quality](#quality) · [Quick start](#quick-start) ·
 [Talk to it](#talk-to-it) · [RAM sizing](#ram-sizing) · [Recipe](docs/swarm/recipe.md) ·
 [Blog post: how we did it](https://ththeod.github.io/flash-next-swarm-quad3090/)**
 
@@ -47,13 +47,58 @@ short prompts, thinking off, 512-token answers. The 80K row is a steady-state wi
 why it reads higher than 8 short requests. Swarm: 40 simulated agents shaped like a real coding-agent harness (MMLU-Pro
 text, thinking off, fixed output lengths), measured for 1,200 s after warm-up; a turn took 76.5 s on average, 52.5 s of
 it queueing for a slot. Prefill: one cold request. These methods differ from those in [README-halt95.md](README-halt95.md)
-(thinking on, 220 W), so the two sets of numbers are not comparable; a same-day comparison with Merlin 3.0.0 on this
-machine is coming. Every run and its spread: [docs/swarm/results.md](docs/swarm/results.md).</sub>
+(thinking on, 220 W), so the two sets of numbers are not comparable; see [Compared with Merlin 3.0.0](#compared-with-merlin-300)
+for a same-day comparison on this machine. Every run and its spread: [docs/swarm/results.md](docs/swarm/results.md).</sub>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/swarm-steps-dark.svg">
   <img src="docs/images/swarm-steps-light.svg" alt="Bar chart: 40-agent swarm turns per minute after each step of the work: 15.9, 23.1, 23.3, 24.2, 25.7, 26.6" width="100%">
 </picture>
+
+## Compared with Merlin 3.0.0
+
+halt95's current release and this fork, on the same machine on the same day (2026-10-23), with the same settings
+(gpu-unlock active, 1400 MHz lock, our caps) and the same benchmarks. Merlin 3.0.0 ran as its own launcher sets it up
+for this checkpoint (`models/swift1.5/serve.sh`, profile fn-swift1.5-quad-3090: MTP K=3, FP8 KV, 8 requests at once,
+no RAM tier). Both columns are single same-day runs (medians of three sends where a test sends three).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/vs-merlin-swarm-dark.svg">
+  <img src="docs/images/vs-merlin-swarm-light.svg" alt="40-agent swarm, turns per minute: flash-next-swarm-quad3090 26.5, Merlin 3.0.0 4.2" width="100%">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/vs-merlin-dark.svg">
+  <img src="docs/images/vs-merlin-light.svg" alt="Ours relative to Merlin 3.0.0: 16 requests 2.02x, 1 request short prompt 1.92x, 8 requests 1.30x, 8 at 80K 1.22x, 1 after 260K 1.14x, 8 agents 1.11x, prefill 50K 1.11x, prefill 260K 1.10x, 1 request thinking on at 4K 0.93x" width="100%">
+</picture>
+
+| Test | Merlin 3.0.0 | This fork |
+|---|---|---|
+| 40-agent swarm, ~100K-token contexts: turns/min | 4.15 | **26.48** |
+| Swarm: mean turn / queue before a slot | 534 s / 425 s | **76 s / 52 s** |
+| Swarm: prompt tokens recomputed | 99.3% | **4.1%** (the rest from the RAM tier) |
+| Generation, 1 / 8 / 16 requests (short prompts, thinking off) | 156 / 586 / 557 | **300 / 764 / 1,124** |
+| 8 requests decoding at 80K context | 659 | **802** |
+| 1 request after a 10K / 50K / 260K prompt | 108 / 105 / 115 | **114 / 116 / 132** |
+| Prefill, 10K / 50K / 260K (needle runs) | 6,892 / 7,418 / 7,003 | **7,526 / 8,256 / 7,737** |
+| 8 × 80K prompts at once (640K tokens) | 82.3 s | **73.0 s** |
+| A 20K prompt arriving next to 8 decodes at 80K | waits for a free slot (249 tok/s effective) | **5,402 tok/s** ¹ |
+| halt95's "agents at once" test, 2 / 4 / 8 agents ² | 224 / 417 / 717 | **349 / 498 / 793** |
+| halt95's decode ladder, 1 request, thinking on, 4K prompt | **183** | 171 |
+| HumanEval, `xhigh`, 64K | 161/164 | 161/164 |
+| MMLU-Pro 280, `xhigh`, 64K | 237/280 | 236/280 |
+| Needles, 10K to 260K | all found | all found |
+
+<sub>¹ Merlin runs at most 8 requests at once, so a ninth waits; ours runs 16. Our same-day figure is from a run of the
+identical build earlier that day (the fresh install's first mixed batch compiles sampler kernels once).
+² halt95's tests, re-implemented from his bench card (his drivers are not published). Merlin's run used ~20K-token
+conversations instead of 16K (a bug in our script, since fixed); its 2-agent figure still matches halt95's own card
+(223.7 vs 223.9 tok/s). A decode-ladder cell at 131K is left out until both builds have run with the fixed script.
+Stock-card (no unlock) numbers for both builds, the way halt95 publishes Merlin, will be added.</sub>
+
+**Where Merlin is ahead:** a single request with thinking on at short context, by about 7% (MTP with 3 drafts suits
+short reasoning text better than our 7-draft DFlash schedule). Everywhere else, and above all with many long
+conversations, this fork is ahead, at the same quality.
 
 ## What this fork changes
 
@@ -170,7 +215,7 @@ unlocked cards without the lock. Details: [docs/swarm/power-and-clocks.md](docs/
 ## Known limitations
 
 - Single-request decode depends on the text: 300-343 tok/s on short prompts, about 115-130 tok/s right after a long
-  prompt of exam questions. The same-day comparison will show how Merlin 3.0.0 does on the same test.
+  prompt of exam questions. With thinking on at short context, Merlin 3.0.0 is about 7% faster.
 - Rare generation loops can run to the token cap (1 of 164 HumanEval items at 64K), as on every build we tested.
 - The first batch that mixes greedy and sampled requests after a fresh install or a configuration change stalls once
   for ~6 s while sampler kernels compile.

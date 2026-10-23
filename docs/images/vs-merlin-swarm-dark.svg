@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-label="40-agent swarm, turns per minute, same machine and day: ours 26.5, Merlin 3.0.0 4.2">
+<rect width="1200" height="300" rx="16" fill="#1a1a19"/>
+<rect x="0.5" y="0.5" width="1199" height="299" rx="16" fill="none" stroke="rgba(255,255,255,0.10)"/>
+<text x="48" y="58" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="22" font-weight="650" fill="#f0efec">40-agent swarm: completed turns per minute</text>
+<text x="48" y="86" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#c3c2b7">40 agents with ~100K-token contexts for 20 minutes, same machine and day; Merlin recomputes 99% of each prompt, ours 4%</text>
+<line x1="300.0" y1="116" x2="300.0" y2="234" stroke="#898781" stroke-width="1"/>
+<text x="300.0" y="256" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">0</text>
+<line x1="570.0" y1="116" x2="570.0" y2="234" stroke="#2c2c2a" stroke-width="1"/>
+<text x="570.0" y="256" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">10</text>
+<line x1="840.0" y1="116" x2="840.0" y2="234" stroke="#2c2c2a" stroke-width="1"/>
+<text x="840.0" y="256" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">20</text>
+<line x1="1110.0" y1="116" x2="1110.0" y2="234" stroke="#2c2c2a" stroke-width="1"/>
+<text x="1110.0" y="256" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">30</text>
+<path d="M300,138.0 H1011.0 Q1015.0,138.0 1015.0,142.0 V158.0 Q1015.0,162.0 1011.0,162.0 H300 Z" fill="#3987e5"><title>flash-next-swarm-quad3090: 26.48 turns/min</title></path>
+<text x="286" y="155.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#c3c2b7">flash-next-swarm-quad3090</text>
+<text x="1025.0" y="155.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#f0efec">26.5</text>
+<path d="M300,194.0 H408.1 Q412.1,194.0 412.1,198.0 V214.0 Q412.1,218.0 408.1,218.0 H300 Z" fill="#d95926"><title>Merlin 3.0.0: 4.15 turns/min</title></path>
+<text x="286" y="211.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#c3c2b7">Merlin 3.0.0</text>
+<text x="422.1" y="211.0" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#f0efec">4.2</text>
+<text x="705" y="280" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">turns per minute</text>
+</svg>
