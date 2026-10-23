@@ -41,6 +41,11 @@ The main benchmark is a 40-agent swarm (`bench/swarm_bench.py`). Forty simulated
 conversations, subagents and tool calls run for 20 minutes, shaped after a real harness. It counts completed turns
 per minute.
 
+<figure class="gif">
+  <iframe src="https://giphy.com/embed/mPOGx4hJtOWSA" title="A huge crowd of cheering Minions" frameborder="0" loading="lazy" allowfullscreen></iframe>
+  <figcaption>The swarm benchmark, artist's impression · <a href="https://giphy.com/gifs/despicable-me-minions-cute-mPOGx4hJtOWSA">via GIPHY</a></figcaption>
+</figure>
+
 | Metric | Value |
 |---|---|
 | 40-agent swarm | 26.6 turns/min, 0 errors in 20 minutes |

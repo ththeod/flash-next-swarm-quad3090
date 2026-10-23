@@ -94,6 +94,11 @@ a:hover { text-decoration-thickness: 2px; }
 .post pre code { padding: 0; background: none; border: 0; font: inherit; }
 .post .highlight .c, .post .highlight .c1 { color: var(--muted); }
 
+/* An embedded GIF: centered, scales down on phones, keeps its aspect ratio. */
+.post figure.gif { max-width: 480px; margin: 28px auto 32px; }
+.post figure.gif iframe { display: block; width: 100%; aspect-ratio: 480 / 259; border: 0; border-radius: 12px; }
+.post figure.gif figcaption { margin-top: 8px; color: var(--muted); font-size: 14px; text-align: center; }
+
 /* Charts break out of the text column so their labels stay readable. */
 .post picture {
   display: block;
