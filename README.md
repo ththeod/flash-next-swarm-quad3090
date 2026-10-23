@@ -5,12 +5,12 @@
   <img src="docs/images/hero-light.svg" alt="flash-next-swarm-quad3090: Swift 1.5 on four RTX 3090s. 1,144 tok/s at 16 requests; 8,490 tok/s prefill; 1.21M-token KV cache plus a RAM tier; 26.6 turns per minute with 40 agents." width="100%">
 </picture>
 
-**Run a coding-agent swarm on four RTX 3090s without giving up answer quality.** This is a fork of
-[halt95's Merlin engine](https://github.com/halt95/merlin-engine) (Flash-Next v2.5.2) that serves halt95's 4-bit build of
+**Run a coding-agent swarm on four RTX 3090s without giving up answer quality.** flash-next-swarm-quad3090 builds on
+[halt95's Merlin engine](https://github.com/halt95/merlin-engine) (Flash-Next v2.5.2) and serves halt95's 4-bit build of
 [Swift 1.5](https://huggingface.co/ukisai/Swift1.5-Qwen3.8-Flash-Next), a post-train of Qwen3.8-Flash-Next (125B MoE),
 tuned for many long conversations at once.
 
-**[Results](#results) · [vs Merlin 3.0.0](#compared-with-merlin-300) · [What it changes](#what-this-fork-changes) · [Quality](#quality) · [Quick start](#quick-start) ·
+**[Results](#results) · [vs Merlin 3.0.0](#compared-with-merlin-300) · [What it changes](#what-it-changes) · [Quality](#quality) · [Quick start](#quick-start) ·
 [Talk to it](#talk-to-it) · [RAM sizing](#ram-sizing) · [Recipe](docs/swarm/recipe.md) ·
 [Blog post: how we did it](https://ththeod.github.io/flash-next-swarm-quad3090/)**
 
@@ -24,9 +24,9 @@ tuned for many long conversations at once.
 - **One command to install.** `./setup.sh` checks your machine, sizes the RAM tier for it, and verifies everything it
   downloads.
 
-**This fork or Merlin 3.0.0?** This fork is built on Flash-Next v2.5.2, the release before halt95's current
+**This project or Merlin 3.0.0?** flash-next-swarm-quad3090 is built on Flash-Next v2.5.2, the release before halt95's current
 [Merlin 3.0.0](https://github.com/halt95/merlin-engine) (vLLM 0.32, seven checkpoints, many more GPU setups). Use Merlin
-3.0.0 for its checkpoints and hardware range. Use this fork to run many coding agents with Swift 1.5 on 4× RTX 3090.
+3.0.0 for its checkpoints and hardware range. Use flash-next-swarm-quad3090 to run many coding agents with Swift 1.5 on 4× RTX 3090.
 Porting these changes onto Merlin 3.0.0 is our next step.
 
 ## Results
@@ -57,7 +57,7 @@ for a same-day comparison on this machine. Every run and its spread: [docs/swarm
 
 ## Compared with Merlin 3.0.0
 
-halt95's current release and this fork, on the same machine on the same day (2026-10-23), with the same settings
+halt95's current release and flash-next-swarm-quad3090, on the same machine on the same day (2026-10-23), with the same settings
 (gpu-unlock active, 1400 MHz lock, our caps) and the same benchmarks. Merlin 3.0.0 ran as its own launcher sets it up
 for this checkpoint (`models/swift1.5/serve.sh`, profile fn-swift1.5-quad-3090: MTP K=3, FP8 KV, 8 requests at once,
 no RAM tier). Both columns are single same-day runs (medians of three sends where a test sends three).
@@ -72,7 +72,7 @@ no RAM tier). Both columns are single same-day runs (medians of three sends wher
   <img src="docs/images/vs-merlin-light.svg" alt="Ours relative to Merlin 3.0.0: 16 requests 2.02x, 1 request short prompt 1.92x, 8 requests 1.30x, 8 at 80K 1.22x, 1 after 260K 1.14x, 8 agents 1.11x, prefill 50K 1.11x, prefill 260K 1.10x, 1 request thinking on at 4K 0.93x" width="100%">
 </picture>
 
-| Test | Merlin 3.0.0 | This fork |
+| Test | Merlin 3.0.0 | flash-next-swarm-quad3090 |
 |---|---|---|
 | 40-agent swarm, ~100K-token contexts: turns/min | 4.15 | **26.48** |
 | Swarm: mean turn / queue before a slot | 534 s / 425 s | **76 s / 52 s** |
@@ -98,9 +98,9 @@ Stock-card (no unlock) numbers for both builds, the way halt95 publishes Merlin,
 
 **Where Merlin is ahead:** a single request with thinking on at short context, by about 7% (MTP with 3 drafts suits
 short reasoning text better than our 7-draft DFlash schedule). Everywhere else, and above all with many long
-conversations, this fork is ahead, at the same quality.
+conversations, flash-next-swarm-quad3090 is ahead, at the same quality.
 
-## What this fork changes
+## What it changes
 
 40 commits on halt95's v2.5.2, one change each, with its measurement in the commit message
 (`release/swarm-v1.0/patches/0099..0138`). How each was found and measured: [the blog post](https://ththeod.github.io/flash-next-swarm-quad3090/).
@@ -142,7 +142,7 @@ scripts/run-swarm.sh  # OpenAI-compatible API on 127.0.0.1:8000
 bench/check.sh        # quick checks against the running server (~10 min)
 ```
 
-`setup.sh` runs halt95's v2.5.2 build script unchanged and then this fork's delta, both verified by commit and tree
+`setup.sh` runs halt95's v2.5.2 build script unchanged and then our changes on top, both verified by commit and tree
 hash. It downloads the checkpoint and the drafter at pinned revisions, checks them against pinned SHA-256 lists, sizes
 the RAM tier for your machine and writes `config/local.env`. Useful options: `--ckpt DIR` reuses a checkpoint you
 already have, `--host 0.0.0.0` serves your network with a generated API key, `--systemd` installs the service,
@@ -237,11 +237,11 @@ More, including what we tried and dropped: [docs/swarm/troubleshooting.md](docs/
 - **halt95**: the Merlin engine and the Flash-Next recipe ([merlin-engine](https://github.com/halt95/merlin-engine)), the
   [Merlin checkpoint](https://huggingface.co/halt95/Qwen3.8-Flash-Next-W4A16-Merlin), the
   [Swift 1.5 build](https://huggingface.co/halt95/Swift1.5-Qwen3.8-Flash-Next-W4A16-Merlin) and its
-  [recipe](https://github.com/halt95/Swift1.5-qwen38-flash-next-3090s), and the KV scales. This fork starts at halt95's
+  [recipe](https://github.com/halt95/Swift1.5-qwen38-flash-next-3090s), and the KV scales. This project starts at halt95's
   v2.5.2 release, its build runs halt95's build script unchanged, halt95's 98 engine commits keep their authorship, and
   halt95's README is kept as [README-halt95.md](README-halt95.md). The RecoverSSM boundary fix (patch 0138) is ported
   from Merlin 3.0.0, and FlashInfer's PCIe all-reduce is switched on as halt95 does there.
-- Everyone halt95 credits for v2.5.2, whose work this fork inherits ([README-halt95.md](README-halt95.md#credits)),
+- Everyone halt95 credits for v2.5.2, whose work this project inherits ([README-halt95.md](README-halt95.md#credits)),
   among them the [peakcrosser7 Flash-Next branch](https://github.com/peakcrosser7/vllm/commits/release/qwen38next_offload)
   behind vLLM PRs #53896 and #53899, and [CoolShades](https://github.com/CoolShades) (the idle-power fix in v2.5.2).
 - **Qwen** ([Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)), **UkisAI**
@@ -254,14 +254,14 @@ More, including what we tried and dropped: [docs/swarm/troubleshooting.md](docs/
 - The two W4A8-INT8 Marlin fixes (patches 0136 and 0137) were found independently; fixes by other authors are open
   upstream: vLLM #61405 by ntovas (the missing global scales), #48926 by lazypool (signed group scales) and #59895 by
   plawanrath (absolute-maximum normalization).
-- This fork: [ththeod](https://github.com/ththeod), developed with [Claude Code](https://claude.com/claude-code).
+- flash-next-swarm-quad3090: [ththeod](https://github.com/ththeod), developed with [Claude Code](https://claude.com/claude-code).
 
 This is an independent derivative. It is not made, reviewed or endorsed by halt95, UkisAI, Qwen or incoai. If this
 work helps you, consider supporting the engine it is built on: [halt95 on Ko-fi](https://ko-fi.com/halt95).
 
 ## License
 
-Code: Apache-2.0 (`LICENSE`), as halt95's engine and vLLM. `NOTICE` lists every file this fork adds or modifies
+Code: Apache-2.0 (`LICENSE`), as halt95's engine and vLLM. `NOTICE` lists every file this project adds or modifies
 relative to halt95's v2.5.2 release (Apache-2.0 §4(b)). `bench/data/` holds GSM8K, HumanEval and MMLU-Pro (MIT; see
 `bench/data/README.md`). This repository ships no model weights. The checkpoint is under the Swift Open License v1.0
 and the Qwen Community License 1.0; read halt95's

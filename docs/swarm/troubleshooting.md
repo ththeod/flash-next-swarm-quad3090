@@ -14,7 +14,7 @@
 | `run-swarm.sh` refuses to start: UNSAFE unlocked cards | the BF16 unlock is active without an active clock lock <= 1400 MHz | [gpu-unlock.md](gpu-unlock.md), step 2 |
 | `gpu-status.sh` shows `gpu_unlock.targets` set but no card unlocked | the machine was rebooted, not powered off | shut down, switch off, start |
 | Corrected PCIe AER errors in `journalctl -k` | marginal Gen4 link (riser, seating) | harmless while corrected; reseat if uncorrected errors or Xid appear |
-| Server output is random multilingual tokens with `VLLM_MARLIN_INPUT_DTYPE=int8` | an extension without this fork's Marlin fixes | `sha256sum vllm-swarm/vllm/_moe_C_stable_libtorch.abi3.so` must match `moe_C_sha256` in `upstream/PIN-swarm-v1.0`; re-run `scripts/build-swarm.sh` |
+| Server output is random multilingual tokens with `VLLM_MARLIN_INPUT_DTYPE=int8` | an extension without this project's Marlin fixes | `sha256sum vllm-swarm/vllm/_moe_C_stable_libtorch.abi3.so` must match `moe_C_sha256` in `upstream/PIN-swarm-v1.0`; re-run `scripts/build-swarm.sh` |
 | CUDA OOM at boot or on the first long prompt | `KV_CACHE_MEMORY` above 3.9e9, or other processes on the GPUs | keep 3.9e9; GPUs must be otherwise empty |
 
 ## Settings that must not be combined

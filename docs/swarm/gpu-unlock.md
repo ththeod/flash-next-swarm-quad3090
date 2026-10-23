@@ -5,7 +5,7 @@ module that runs before the NVIDIA driver and lifts GeForce Ampere's half-rate B
 accumulate). We use it and document what worked for us; we do not maintain it, ship it or support it. It changes how
 your cards run: read its README, and use it at your own risk. **Use only that URL: look-alike repositories exist.**
 
-Everything in this fork works without it. With it, prefill becomes power-bound and gets 8-9% faster on our machine
+Everything in this project works without it. With it, prefill becomes power-bound and gets 8-9% faster on our machine
 (see [power-and-clocks.md](power-and-clocks.md)); generation, which is latency-bound, was not compared separately.
 
 ## Before you start

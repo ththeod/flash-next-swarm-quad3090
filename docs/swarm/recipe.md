@@ -25,7 +25,7 @@ kernel 7.0, NVIDIA open driver 610.57.04 with the P2P patch.
   P2P patch for your exact driver version (we used aikitoria's `610.57.04-p2p-v3` branch of
   `open-gpu-kernel-modules`), install them under `/lib/modules/$(uname -r)/updates/`, run `depmod -a` and
   `update-initramfs -u`, and reboot.
-- Check: `nvidia-smi topo -p2p r` (or `scripts/gpu-status.sh`) shows `OK` between every pair. This fork was tested only
+- Check: `nvidia-smi topo -p2p r` (or `scripts/gpu-status.sh`) shows `OK` between every pair. This project was tested only
   with P2P; its all-reduce settings assume it. halt95's release also runs without P2P, with slower prefill.
 - A kernel update needs the modules rebuilt. Keep the stock modules installed as the fallback.
 
@@ -40,13 +40,13 @@ cd flash-next-swarm-quad3090
 # halt95's v2.5.2 release assets (hash-checked by halt95's build script)
 curl -fLO https://github.com/halt95/merlin-engine/releases/download/v2.5.2/v2.5.2-from-upstream-v0.30.0.bundle.gz
 curl -fLO https://github.com/halt95/merlin-engine/releases/download/v2.2.0/build-artifacts-sm86-py313-cu130-v2.2.0.tar.gz
-# this fork's MoE extension (downloaded automatically if absent)
+# this project's MoE extension (downloaded automatically if absent)
 curl -fLO https://github.com/ththeod/flash-next-swarm-quad3090/releases/download/swarm-v1.0/moe-C-sm86-py313-cu134-swarm-v1.0.tar.gz
 scripts/build-swarm.sh vllm-swarm venv-swarm
 ```
 
 `build-swarm.sh` runs halt95's `scripts/build-v2.5.sh` unchanged (vLLM v0.30.0 + halt95's 98 commits, pinned venv,
-halt95's build products), then fetches this fork's bundle, verifies the commit and tree against
+halt95's build products), then fetches this project's bundle, verifies the commit and tree against
 `upstream/PIN-swarm-v1.0`, installs the rebuilt MoE extension and FlashInfer 0.7.0.post1, and re-hashes every build
 product. The prebuilt extension needs glibc 2.38 or newer (Ubuntu 24.04, Debian 13). On older systems, or to build
 everything yourself, use `BUILD_OWN=1 scripts/build-swarm.sh ...` (15-30 min; needs cmake >= 3.26; halt95's tarball
