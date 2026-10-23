@@ -91,7 +91,7 @@ no RAM tier). Both columns are single same-day runs (medians of three sends wher
 
 <sub>¹ Merlin runs at most 8 requests at once, so a ninth waits; ours runs 16. Our same-day figure is from a run of the
 identical build earlier that day (the fresh install's first mixed batch compiles sampler kernels once).
-² halt95's tests, re-implemented from his bench card (his drivers are not published). Merlin's run used ~20K-token
+² halt95's tests, re-implemented from the bench card (its drivers are not published). Merlin's run used ~20K-token
 conversations instead of 16K (a bug in our script, since fixed); its 2-agent figure still matches halt95's own card
 (223.7 vs 223.9 tok/s). A decode-ladder cell at 131K is left out until both builds have run with the fixed script.
 Stock-card (no unlock) numbers for both builds, the way halt95 publishes Merlin, will be added.</sub>
