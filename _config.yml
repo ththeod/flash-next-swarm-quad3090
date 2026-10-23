@@ -1,3 +1,7 @@
 title: flash-next-swarm-quad3090
-description: Qwen3.8-Flash-Next on 4x RTX 3090, tuned for agent swarms
-theme: jekyll-theme-minimal
+description: Serving coding-agent swarms on four RTX 3090s without giving up quality
+repo: https://github.com/ththeod/flash-next-swarm-quad3090
+author: ththeod
+lang: en
+plugins:
+  - jekyll-seo-tag
