@@ -85,7 +85,7 @@ CACHE_ROOT). The n-gram table must never swap; the systemd unit sets `MemorySwap
 ## 6. Power and clocks
 
 Copy `systemd/gpu-power.example` to `/etc/default/gpu-power`, adjust the bus ids and caps, and install
-`systemd/gpu-power.service`. *Optional:* the third-party BF16 unlock, with the clock lock it requires:
+`systemd/gpu-power.service`. *Optional:* Zagitta's BF16 unlock, with the clock lock it requires:
 [gpu-unlock.md](gpu-unlock.md). Background and measurements: [power-and-clocks.md](power-and-clocks.md).
 
 ## 7. Start

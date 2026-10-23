@@ -24,9 +24,9 @@ tuned for many long conversations at once.
 - **One command to install.** `./setup.sh` checks your machine, sizes the RAM tier for it, and verifies everything it
   downloads.
 
-**This project or Merlin 3.0.0?** flash-next-swarm-quad3090 is built on Flash-Next v2.5.2, the release before halt95's current
+**Our version or Merlin 3.0.0?** Our version is built on Flash-Next v2.5.2, the release before halt95's current
 [Merlin 3.0.0](https://github.com/halt95/merlin-engine) (vLLM 0.32, seven checkpoints, many more GPU setups). Use Merlin
-3.0.0 for its checkpoints and hardware range. Use flash-next-swarm-quad3090 to run many coding agents with Swift 1.5 on 4× RTX 3090.
+3.0.0 for its checkpoints and hardware range. Use our version to run many coding agents with Swift 1.5 on 4× RTX 3090.
 Porting these changes onto Merlin 3.0.0 is our next step.
 
 ## Results
@@ -57,7 +57,7 @@ for a same-day comparison on this machine. Every run and its spread: [docs/swarm
 
 ## Compared with Merlin 3.0.0
 
-halt95's current release and flash-next-swarm-quad3090, on the same machine on the same day (2026-10-23), with the same settings
+halt95's current release and our version, on the same machine on the same day (2026-10-23), with the same settings
 (gpu-unlock active, 1400 MHz lock, our caps) and the same benchmarks. Merlin 3.0.0 ran as its own launcher sets it up
 for this checkpoint (`models/swift1.5/serve.sh`, profile fn-swift1.5-quad-3090: MTP K=3, FP8 KV, 8 requests at once,
 no RAM tier). Both columns are single same-day runs (medians of three sends where a test sends three).
@@ -72,7 +72,7 @@ no RAM tier). Both columns are single same-day runs (medians of three sends wher
   <img src="docs/images/vs-merlin-light.svg" alt="Ours relative to Merlin 3.0.0: 16 requests 2.02x, 1 request short prompt 1.92x, 8 requests 1.30x, 8 at 80K 1.22x, 1 after 260K 1.14x, 8 agents 1.11x, prefill 50K 1.11x, prefill 260K 1.10x, 1 request thinking on at 4K 0.93x" width="100%">
 </picture>
 
-| Test | Merlin 3.0.0 | flash-next-swarm-quad3090 |
+| Test | Merlin 3.0.0 | Our version |
 |---|---|---|
 | 40-agent swarm, ~100K-token contexts: turns/min | 4.15 | **26.48** |
 | Swarm: mean turn / queue before a slot | 534 s / 425 s | **76 s / 52 s** |
@@ -98,7 +98,7 @@ Stock-card (no unlock) numbers for both builds, the way halt95 publishes Merlin,
 
 **Where Merlin is ahead:** a single request with thinking on at short context, by about 7% (MTP with 3 drafts suits
 short reasoning text better than our 7-draft DFlash schedule). Everywhere else, and above all with many long
-conversations, flash-next-swarm-quad3090 is ahead, at the same quality.
+conversations, our version is ahead, at the same quality.
 
 ## What it changes
 
@@ -201,8 +201,8 @@ Only the 256 GB row is measured so far. Details, and what a 64 GB machine would 
 
 ## Hardware tuning (optional)
 
-GeForce Ampere runs BF16/FP16 tensor math with FP32 accumulate at half the workstation rate. The third-party
-[gpu-unlock](https://github.com/Zagitta/gpu-unlock) module (Zagitta; not part of this project, use only this URL) lifts
+GeForce Ampere runs BF16/FP16 tensor math with FP32 accumulate at half the workstation rate. Zagitta's
+[gpu-unlock](https://github.com/Zagitta/gpu-unlock) module (not part of this project; use only this URL) lifts
 that limit. It is volatile and needs a cold power cycle. On the same build it added 8-9% prefill, which then became
 power-bound. How we set it up, check it and undo it: [docs/swarm/gpu-unlock.md](docs/swarm/gpu-unlock.md).
 

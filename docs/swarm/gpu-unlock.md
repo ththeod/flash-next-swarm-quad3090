@@ -1,4 +1,4 @@
-# The BF16 unlock (optional, third-party)
+# The BF16 unlock (optional, by Zagitta)
 
 **gpu-unlock is not part of this project.** It is [Zagitta/gpu-unlock](https://github.com/Zagitta/gpu-unlock), a kernel
 module that runs before the NVIDIA driver and lifts GeForce Ampere's half-rate BF16/FP16 tensor math (FP32
