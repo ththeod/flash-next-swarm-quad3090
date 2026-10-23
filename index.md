@@ -22,9 +22,9 @@ flash-next-swarm-quad3090 is a fork of halt95's v2.5.2 with 40 changes for that 
 fine-tune of Qwen3.8-Flash-Next, and adds:
 
 - a RAM tier that keeps conversations warm;
-- the DFlash 2 drafter;
-- an FP4 KV cache that holds 1.2M tokens;
-- shorter decode steps;
+- a better drafter, which guesses tokens ahead (DFlash 2);
+- a 4-bit KV cache, the model's working memory, which holds 1.2M tokens;
+- less wasted work per generated token;
 - faster communication between the GPUs.
 
 On the same hardware and the same day, a 40-agent benchmark ran at 26.5 turns a minute on the fork and 4.2 on
@@ -44,7 +44,7 @@ A swarm is bigger than that. Forty subagents with 100K-token prompts need severa
 them, and four 3090s hold about 925K. Whatever doesn't fit is evicted and later recomputed, at a few thousand tokens
 per second, while the agent waits.
 
-So the fork aims to keep many long conversations warm, decode many requests at once, and let a fresh prompt in
+So the fork aims to keep many long conversations warm, generate for many requests at once, and let a fresh prompt in
 without stalling everyone else. And every answer has to be as good as before.
 
 ## How we measured
@@ -56,16 +56,16 @@ sizes, answer lengths, subagent fan-out and tool time follow aggregate statistic
 The text is MMLU-Pro questions, and answer lengths are fixed, so runs compare. It reports completed turns per minute,
 queue time, time to first token, and where each prompt token came from: recomputed, the GPU cache or the RAM tier.
 
-The **long-context probe** (`prof_longctx.py`) has eight requests decode at 80K context while a new 20K prompt
+The **long-context probe** (`prof_longctx.py`) has eight requests generate at 80K context while a new 20K prompt
 arrives. That is the moment a swarm stalls.
 
 Every change also had to pass quality gates:
 
 - a detector for garbage and runaway output;
-- a NaN probe;
+- a check for numerical errors (NaN) in the output;
 - needle-in-a-haystack tests from 10K to 260K tokens;
 - HumanEval and MMLU-Pro at `xhigh` reasoning with a 64K-token budget;
-- perplexity checks for precision changes;
+- for changes to number precision, a perplexity check: how well the model predicts known text;
 - a check that a conversation resumed from RAM produces exactly the same tokens as one resumed from the GPU cache.
 
 A change that failed was dropped, however fast it was.
@@ -73,154 +73,139 @@ A change that failed was dropped, however fast it was.
 Each change was tested from a clean boot against a baseline measured the same day. Changes that interacted were also
 tested alone and together.
 
-To decide what to try, we profiled. The four GPUs run as two pipeline stages of two GPUs each. Small tools on top of
-torch-profiler traces split each decode step into three parts:
-
-- each stage's compute;
-- the hand-off between stages;
-- the time spent waiting on all-reduces, the step where GPUs combine their partial results.
-
-Kernels that looked slow got their own microbenchmarks. One tip if you tune kernels on 3090s: leave idle gaps between
-timing runs. Back to back under a power cap, the cards throttle so hard that the timings pick the wrong plans.
+To decide what to try, we profiled: we recorded where every millisecond of a generation step goes on every GPU,
+and timed slow pieces of GPU code on their own. One tip if you tune GPU code on 3090s: leave idle gaps between timing
+runs. Back to back under a power cap, the cards throttle so hard that the timings pick the wrong settings.
 
 ## What the fork changes
 
-Each section covers one area. The patches are in `release/swarm-v1.0/patches/`, and each commit message includes its
-own measurement.
+Each section says what was slow before, what the fork does differently, and why that helps. The patch numbers point
+to the code in `release/swarm-v1.0/patches/`.
 
-### 1. Agent conversations stay in RAM
+One thing helps with the rest: the model runs in two halves, each on a pair of GPUs. The halves work like an assembly
+line, and within a pair the two GPUs split each layer's math between them.
 
-vLLM can copy KV-cache blocks to system RAM and load them back later. Flash-Next makes that harder, because it is a
-hybrid. Alongside attention, it has DeltaNet layers, which don't keep a cache per token. Instead, they keep one
-running state that sums up everything so far, and that state only exists where it was saved. Resuming a conversation
-from RAM needs two things: the attention blocks, and a saved state at exactly the token where the next turn starts.
-It also has to keep working with halt95's RecoverSSM, which rebuilds that state after speculative decoding.
+### 1. Conversations stay in RAM
 
-The fork makes the RAM tier work for this model:
+halt95's build keeps conversations only in GPU memory. When that fills up, the oldest are thrown away. When an agent
+comes back, its whole prompt is recomputed, which takes over ten seconds for 100K tokens even at full speed.
 
-- **The two pipeline stages get a uniform layout in the shared RAM region.** The stages hold different layers, so
-  they computed different block sizes, overwrote each other's slots, and reloaded conversations came back corrupted.
-- **A turn resumes from the state saved at the end of the previous turn.** Lookups used to stop one or two blocks
-  earlier, so every turn recomputed about 15K tokens. Now it is about 4K.
-- **Per-layer state is stored once instead of twice,** and eviction uses ARC instead of LRU. A burst of short
-  subagents no longer pushes out the long-lived parent conversations.
-- **A request waiting for its RAM lookup keeps its place in line.** It used to jump ahead of older requests and, if
-  it couldn't get memory, block everything behind it. That stalled preempted requests for minutes in the middle of an
-  answer.
-- **A fence stops a block from being reused while its copy to RAM is still running.**
-- **Extra saved states are dropped while memory is short.** Each one costs a running request about one block of GPU
-  memory. They come back after a quiet spell.
+vLLM can already park conversations in system RAM, but not for this model. Flash-Next mixes two kinds of layers.
+Attention layers keep a note for every token, and those notes can be copied out and back in pieces. DeltaNet layers
+keep one running summary of the whole conversation instead, and that summary only exists where it was saved. To
+resume from RAM, you need a summary saved at exactly the token where the last turn ended.
 
-In the swarm benchmark, 96% of prompt tokens come back from RAM instead of being recomputed. The tier is sized from
-your RAM (see [Run it yourself](#run-it-yourself)).
+The fork saves that summary at the end of every turn and resumes from there. Loading a conversation back from RAM is
+much faster than recomputing it, so in the swarm benchmark 96% of prompt tokens now come from RAM. The fork also fixes
+the bugs that showed up under real swarms:
+
+- the two GPU pairs overwrote each other's data in RAM;
+- some data was stored twice;
+- a request waiting for its data could jump the queue and block everyone behind it.
+
+Long-lived parent conversations are now protected from being pushed out by bursts of short subagents.
 
 *Patches 0099, 0121–0130.*
 
-### 2. A better drafter: DFlash 2
+### 2. Better guesses: the DFlash 2 drafter
 
-Speculative decoding uses a drafter to guess the next few tokens, and the big model checks all the guesses in one
-step. halt95's build uses the model's own MTP head, which guesses three tokens at a time. incoai's
-[DFlash 2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) is a separate drafter. It predicts a block of
-tokens from the hidden states of five layers of the big model.
+When a GPU generates text one token at a time, it spends most of each step reading the model's weights for that one
+token. Speculative decoding makes better use of that work. A small, fast drafter guesses several tokens ahead, and the
+big model checks all the guesses in one step, keeping the ones it agrees with.
 
-The drafter runs on the second pipeline stage, so the fork passes those hidden states over from the first stage. It
-also fixes what broke:
+halt95's build uses the model's built-in drafter (MTP), which guesses 3 tokens at a time. The fork uses incoai's
+[DFlash 2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2). It is a separately trained drafter that sees
+more of the big model's internal state and guesses up to 7 tokens. It is right more often: 3.4–3.6 tokens are kept
+per step, against 3.1. So every step produces more text, and a single request on a code prompt decodes about 50%
+faster.
 
-- **A torch.compile deadlock** with seven drafts and the RAM tier.
-- **NaN drafts after RAM-tier hits.** The asynchronous loads skipped zeroing the drafter's window.
-- **Out-of-memory errors on the last stage.** Prompt log-probability requests caused them, so the server now refuses
-  those. The drafter's embedding table also moved to pinned host memory, which frees about 636 MB per GPU on that
-  stage.
-
-DFlash 2 gets more of its guesses right: 3.4–3.6 accepted tokens per step, against 3.1 for MTP. On a fixed code
-prompt, that made single-request decode about 50% faster. The fork uses 7 drafts for a single request and fewer as
-load grows, down to 2 at 9–16 requests, because wrong guesses cost more when the GPUs are busy.
+With many requests the GPUs are already busy, so wrong guesses cost more. The fork makes fewer guesses as load grows,
+down to 2.
 
 *Patches 0100–0103, 0108–0113.*
 
-### 3. A bigger KV cache: FP4 attention KV
+### 3. More room: a 4-bit KV cache
 
-DFlash 2's sliding-window layers would cut the KV cache to a third, because they make every cache block much bigger
-on the last stage. The fork gives the drafter its own small scratch cache instead, so the pool stays a little above
-halt95's.
+The KV cache is the model's working memory: notes on every token of every conversation it holds. Its size decides how
+many tokens fit in VRAM at once. halt95's build stores those notes as 8-bit numbers. The fork stores them as 4-bit
+numbers, with a shared scale for every 16 values, so the same VRAM holds 26–28% more tokens.
 
-Then the fork stores attention KV in FP4, with one FP8 scale per 16 values. That holds 26–28% more tokens than FP8.
-The first version was slow, and the profile showed two reasons:
+The first 4-bit version made prompt processing several times slower, for two reasons:
 
-- **Unpacking the values made prefill 4.5× slower than FP8.** Each FP4 value went through an `exp2` in FP32. Building
-  the value bit by bit in BF16 is exact for all 16 FP4 codes and removes that cost.
-- **The sparse attention kernel was still 5.7× slower.** The tuned prefill setup used a single warp, so FP4's tiles
-  ran out of registers. A minimum warp count and a dedicated split-K kernel bring FP4 up to FP8 speed.
+- unpacking each 4-bit number used slow floating-point math;
+- the attention code was tuned for 8-bit data.
 
-With the INT8 activations from section 6, the pool holds **1,212,416 tokens**.
+The fork unpacks with simple bit operations, which give exactly the same values, and uses attention code written for
+4-bit data. It now runs as fast as 8-bit, and the scores didn't drop (see [Keeping quality](#keeping-quality)).
+
+The fork also gives DFlash 2 its own small cache. Otherwise the drafter's memory needs would have cut the main cache
+to a third. Altogether the cache holds 1.21M tokens, against 925K in halt95's build.
 
 *Patches 0104–0107, 0133–0135.*
 
-### 4. Shorter decode steps
+### 4. Less wasted work per step
 
-The profile of a decode step at one request showed that the hand-off between stages costs almost nothing. The second
-stage takes the larger share, because it also runs the output head, the sampler and the drafter. Half of the compute
-was dense BF16 matrix multiplies on only 8 rows: one token plus seven drafts. The GPU's tensor-core tiles are 16 rows
-tall, so they ran mostly empty. The fork changes three things:
+Profiling one generation step showed that half the time went to matrix multiplications. The GPU's math units work on
+blocks of 16 rows, but a single request only gives them 8 (one token plus seven guesses), so the blocks ran half empty.
+The fork changes three things:
 
-- **A Triton matrix multiply for that thin shape.** Its plans are tuned per weight shape, and it adds a fused kernel
-  for the hyper-connection layers. It makes one request 9–16% faster.
-- **The custom all-reduce is back on.** An inherited setting had turned it off. It is worth about 5% at one request.
-- **Small-batch MoE kernels and a cheaper end of each step.** The end of each step now uses a sparse logits gather, an
-  INT8 draft head and a sampler that takes the top-k first. These save about 0.55 ms per step.
+- it adds matrix code sized for these small batches;
+- it switches back on a fast method for adding up partial results between GPUs, which the inherited configuration had
+  turned off;
+- it trims the work of picking the next token.
 
-Together, these make single-request decode about 23% faster.
+A single request now decodes about 23% faster.
 
-With 8–16 requests, the profile showed a different problem. The two stages take turns on two micro-batches, and each
-request stayed in whichever micro-batch it joined first. With 8 requests, the split could be 6/2 or 7/1 instead of
-4/4, and the bigger micro-batch set the pace of every step. Balancing them makes 16 requests **34% faster** and 8
-requests 16% faster.
+With several requests at once, a different problem showed up. The assembly line works on two groups of requests and
+moves at the pace of the bigger group, and the groups were often uneven: 6 and 2 instead of 4 and 4. The fork keeps
+them even, which makes 16 requests 34% faster.
 
 *Patches 0114–0118, 0131.*
 
-### 5. A new prompt no longer stalls everyone
+### 5. A new prompt no longer freezes everyone
 
-The long-context probe found the worst moment for a swarm. Before these changes, eight requests were decoding at 80K
-context when a new 20K prompt arrived. The eight dropped to 27 tok/s between them for 13.5 seconds, and the new
-prompt prefilled at under a third of its normal speed. The profile pointed at communication between the GPUs:
+When a long new prompt arrived while other requests were generating, they all froze for seconds. In the long-context
+probe, eight requests generating at 80K context dropped to 27 tok/s combined for 13.5 seconds while a 20K prompt was
+processed.
 
-- **The custom all-reduce is fast only when the GPUs share a PCIe root complex,** the part of the CPU that their slots
-  connect to. Many boards spread four GPUs over more than one root complex, and across them, a prefill-sized
-  all-reduce took almost four times as long as NCCL's. The fork checks where each GPU sits at startup. It uses the
-  custom all-reduce only within one root complex and only for messages under 128 KB.
-- **NCCL's LL protocol is slow for prefill-sized messages,** more than twice as slow as its Simple protocol. The fork
-  allows both (`NCCL_PROTO=LL,Simple`), so small decode messages still use LL.
-- **FlashInfer 0.7 has a PCIe all-reduce for small messages,** which halt95 also turned on in Merlin 3.0.0. It makes
-  a mixed prefill-and-decode step 8% shorter and generation at 8–16 requests 9–11% faster.
+The cause was traffic between the GPUs. The two GPUs in a pair add up their partial results after every layer. The
+fast method from section 4 is only fast when both GPUs connect to the same PCIe branch of the CPU. On many boards they
+don't, and for the large transfers of prompt processing, the fast method took almost four times as long as NVIDIA's
+standard library, NCCL. The fork changes three things:
 
-Now the same new prompt is done in 3.6 seconds instead of 13.5, at about 5,600 tok/s. The eight running requests
-keep decoding at 100–115 tok/s through it.
+- it checks how the GPUs are connected at startup, and uses the fast method only for small transfers on a shared
+  branch;
+- it lets NCCL switch to its faster mode for large transfers;
+- it uses FlashInfer's newer method for small transfers, as halt95's Merlin 3.0.0 does.
+
+With these changes and the faster prompt processing from sections 6 and 7, the freeze is down to 3.6 seconds. The
+other requests keep generating at 100–115 tok/s through it.
 
 *Patch 0132, plus NCCL and FlashInfer settings.*
 
-### 6. INT8, which GeForce runs at full speed
+### 6. 8-bit math, which GeForce runs at full speed
 
-GeForce Ampere cards run BF16 math with FP32 accumulation at half the rate of the workstation cards, but INT8 at the
-full rate. vLLM's Marlin kernels can quantize the MoE activations to INT8 per token. On this checkpoint, though, that
-path produced garbage from the very first token, because of two bugs:
+GeForce 3090s are deliberately limited. The 16-bit math this model normally uses (BF16) runs at half the speed it
+does on the same chip in a workstation card, but 8-bit integer math (INT8) runs at full speed.
 
-- the compressed-tensors MoE method never passed the INT8 global activation scales to the kernel;
-- the kernel read the normalized group scales as unsigned, but half of this checkpoint's scales are negative.
+vLLM can convert the numbers going into the model's expert layers to INT8 on the fly. With this model, though, it
+produced garbage from the first token, because of two bugs in how it handled the scale factors that keep 8-bit values
+accurate. The fork fixes both. Fixes by other people for the same bugs are waiting in vLLM (PRs #61405, #48926 and
+#59895).
 
-Other authors have fixes for the same bugs waiting upstream (vLLM PRs #61405, #48926 and #59895). With both bugs
-fixed, INT8 activations make prefill 11–12% faster on stock cards. The cost is a small rise in perplexity on code,
-covered in the quality section.
+Prompt processing is 11–12% faster on stock cards, at a small cost on code (see [Keeping quality](#keeping-quality)).
 
 *Patches 0136, 0137.*
 
 ### 7. Optional: the BF16 unlock
 
-The third-party [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module removes GeForce's half-rate BF16
-limit. It is not part of this project, and you use it at your own risk. It adds another 8–9% to prefill and makes the
-cards power-bound.
+The third-party [gpu-unlock](https://github.com/Zagitta/gpu-unlock) kernel module removes that half-speed BF16 limit.
+It is not part of this project, and you use it at your own risk. It makes prompt processing another 8–9% faster, and
+the cards then run at their power limits.
 
-Unlocked cards draw short spikes at the start of each burst of work. These spikes can trip a power supply even when
-the average draw is well within its rating. Power caps react too slowly to stop them, but a clock lock contains them.
+Unlocked cards draw short power spikes at the start of each burst of work. These spikes can trip a power supply even
+when the average draw is well within its rating. Power caps react too slowly to catch them, but a clock lock keeps
+them in check.
 
 On stock cards, use halt95's 220 W per card. With the unlock, we recommend 240 W per card and a 1400 MHz lock.
 `run-swarm.sh` refuses to start on unlocked cards without the lock. The
@@ -230,21 +215,22 @@ details.
 ## Keeping quality
 
 Speed changes are easy to make and easy to get wrong, so every change went through the gates above. Here are the
-release configuration's results at `xhigh` with a 64K-token budget. HumanEval and MMLU-Pro also show halt95's Merlin
-3.0.0, run on the same checkpoint on the same day:
+release configuration's results, with reasoning at `xhigh` and a 64K-token budget. For HumanEval and MMLU-Pro, the
+table also shows halt95's Merlin 3.0.0, run on the same model on the same day:
 
 | Check | This fork | Merlin 3.0.0 |
 |---|---|---|
 | HumanEval | 161/164 | 161/164 |
 | MMLU-Pro, 280 questions | 236/280 | 237/280 |
 | Needles, 10K to 260K tokens | all found | not run |
-| RAM-tier resume vs GPU-cache resume, greedy | bit-exact (4/4) | no RAM tier |
-| Garbage / runaway gate, NaN probe | clean on every run | not run |
+| Conversation resumed from RAM vs from GPU memory | identical output (4/4) | no RAM tier |
+| Garbage, runaway and NaN checks | clean on every run | not run |
 
-Repeat runs scored 159–162 on HumanEval. MMLU-Pro moves by about ±4 between runs: BF16 activations scored 239, FP8 KV
-232. So the differences in the table are noise.
+Repeat runs scored 159–162 on HumanEval, and MMLU-Pro moves by about ±4 between runs. Other configurations landed in
+the same range: 239 with 16-bit math instead of INT8, and 232 with the 8-bit KV cache. So the differences in the table
+are noise.
 
-The one cost we could measure is from INT8 activations. Perplexity on code is 0.9–1.5% higher than with BF16, prose
+The one cost we could measure is from INT8 math. Perplexity on code is 0.9–1.5% higher (worse) than with BF16, prose
 is unchanged, and the evals show no difference. To turn INT8 off, leave `VLLM_MARLIN_INPUT_DTYPE` empty in
 `config/swarm.env`.
 
@@ -263,10 +249,11 @@ is unchanged, and the evals show no difference. To turn INT8 off, leave `VLLM_MA
   <img src="assets/swarm-steps-light.svg" alt="Bar chart: 40-agent swarm turns per minute after each step: 15.9, 23.1, 23.3, 24.2, 25.7, 26.6" width="100%">
 </picture>
 
-Generation figures are for short prompts with thinking off, added up over all requests.
+Generation figures are for short prompts with thinking off, added up over all requests. Prefill is prompt
+processing.
 
 The chart shows how much each group of changes added to the swarm. It starts from the first working RAM tier. Power
-settings changed between steps, so read it as a rough guide, not a clean ablation. The next section compares against
+settings changed between steps, so read it as a rough guide, not an exact measurement of each change. The next section compares against
 halt95's release, which has no RAM tier.
 
 ## Against halt95's latest: Merlin 3.0.0
@@ -294,10 +281,11 @@ To be fair to Merlin, this is a workload it doesn't claim to serve. Its own benc
 
 On the smaller tests, the fork is ahead by 10–30% on prefill, long-context decode and 8 requests. At 16 requests the
 gap is about 2×, because Merlin serves at most 8 requests at a time and the rest wait. A single short request is 1.9×
-faster too. That comes mostly from the drafter and the shorter decode steps (sections 2 and 4).
+faster too. That comes mostly from the drafter and the less wasteful generation steps (sections 2 and 4).
 
 Merlin wins one test, by 7%: a single request with thinking on and a 4K prompt. Thinking text is harder to guess than
-code, and the fork spends 7 drafts on a single request. Most likely, Merlin's 3-draft MTP wastes less work there.
+code, and for a single request the fork makes 7 guesses per step. Most likely, Merlin's 3 guesses waste less work
+there.
 
 halt95 doesn't publish the bench card's drivers, so we re-implemented its tests. Merlin reproduces the published
 number in our runs: 223.7 tok/s with 2 agents, against 223.9 on the card. The fork is 11–56% ahead with 2–8 agents.
@@ -309,13 +297,11 @@ unlock here. halt95 publishes Merlin's numbers on stock cards, and we'll add tho
 
 ## What did not work
 
-- **Bigger prefill chunks** (2,048 and 4,096 tokens) ran the last pipeline stage out of memory.
-- **Keeping the DeltaNet state in BF16** instead of FP32 gained no capacity, because the state page is padded back to
-  the same size.
-- **Three kernel tweaks gave no measurable gain:** 8 warps for the FP4 attention kernel, a smaller Marlin MoE block
-  size, and a different way of sorting tokens by expert. Savings of about 2 µs per layer disappear in the noise of an
-  end-to-end test.
-- **Moving a layer from one pipeline stage to the other** would cost about 20% of the KV cache.
+- **Bigger chunks for prompt processing** ran the second GPU pair out of memory.
+- **Storing the DeltaNet summary in 16-bit** instead of 32-bit saved no memory, because the memory is reserved in
+  fixed-size pages either way.
+- **Several smaller tweaks to the GPU code** saved about 2 µs per layer, too little to measure in real use.
+- **Moving a layer from one GPU pair to the other** would have cost about 20% of the KV cache.
 
 ## Run it yourself
 
@@ -333,7 +319,7 @@ sizes for common RAM amounts.
 ## What's next
 
 - Numbers for stock cards for both builds, measured the way halt95 publishes Merlin's.
-- Fewer drafts for short requests with thinking on, the one test where Merlin is ahead.
+- Fewer guesses for short requests with thinking on, the one test where Merlin is ahead.
 
 If you run the fork, please [open an issue](https://github.com/ththeod/flash-next-swarm-quad3090/issues) with your
 board, RAM and numbers. We especially want to hear if they disagree with ours.
