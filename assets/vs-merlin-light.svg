@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="548" viewBox="0 0 1200 548" role="img" aria-label="Ours relative to Merlin 3.0.0, same machine and day: Generation, 16 requests 2.02x; Generation, 1 request, short prompt 1.92x; Generation, 8 requests 1.30x; Generation, 8 requests at 80K context 1.22x; 1 request after a 260K prompt 1.14x; 8 agents at once (halt95's test) 1.11x; Prefill, 50K prompt 1.11x; Prefill, 260K prompt 1.10x; 1 request, thinking on, 4K (halt95's test) 0.93x">
+<rect width="1200" height="548" rx="16" fill="#fcfcfb"/>
+<rect x="0.5" y="0.5" width="1199" height="547" rx="16" fill="none" stroke="rgba(11,11,11,0.10)"/>
+<text x="48" y="58" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="22" font-weight="650" fill="#0b0b0b">flash-next-swarm-quad3090 relative to Merlin 3.0.0</text>
+<text x="48" y="86" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">Same machine, same day, same settings; 1.0× = Merlin 3.0.0; right of the line = ours is faster</text>
+<line x1="535.7" y1="112" x2="535.7" y2="478" stroke="#898781" stroke-width="1"/>
+<text x="535.7" y="500" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">1.0×</text>
+<line x1="775.0" y1="112" x2="775.0" y2="478" stroke="#e1e0d9" stroke-width="1"/>
+<text x="775.0" y="500" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">1.5×</text>
+<line x1="1014.3" y1="112" x2="1014.3" y2="478" stroke="#e1e0d9" stroke-width="1"/>
+<text x="1014.3" y="500" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">2.0×</text>
+<path d="M535.7,128.0 H1019.2 Q1023.2,128.0 1023.2,132.0 V144.0 Q1023.2,148.0 1019.2,148.0 H535.7 Z" fill="#2a78d6"><title>Generation, 16 requests: ours 1,124.0, Merlin 556.8 (2.02×)</title></path>
+<text x="426" y="143.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">Generation, 16 requests</text>
+<text x="1033.2" y="143.0" text-anchor="start" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">2.02×</text>
+<path d="M535.7,168.0 H972.2 Q976.2,168.0 976.2,172.0 V184.0 Q976.2,188.0 972.2,188.0 H535.7 Z" fill="#2a78d6"><title>Generation, 1 request, short prompt: ours 299.6, Merlin 156.0 (1.92×)</title></path>
+<text x="426" y="183.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">Generation, 1 request, short prompt</text>
+<text x="986.2" y="183.0" text-anchor="start" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">1.92×</text>
+<path d="M535.7,208.0 H676.8 Q680.8,208.0 680.8,212.0 V224.0 Q680.8,228.0 676.8,228.0 H535.7 Z" fill="#2a78d6"><title>Generation, 8 requests: ours 763.9, Merlin 586.2 (1.30×)</title></path>
+<text x="426" y="223.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">Generation, 8 requests</text>
+<text x="690.8" y="223.0" text-anchor="start" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">1.30×</text>
+<path d="M535.7,248.0 H635.6 Q639.6,248.0 639.6,252.0 V264.0 Q639.6,268.0 635.6,268.0 H535.7 Z" fill="#2a78d6"><title>Generation, 8 requests at 80K context: ours 802.3, Merlin 659.2 (1.22×)</title></path>
+<text x="426" y="263.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">Generation, 8 requests at 80K context</text>
+<text x="649.6" y="263.0" text-anchor="start" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">1.22×</text>
+<path d="M535.7,288.0 H600.9 Q604.9,288.0 604.9,292.0 V304.0 Q604.9,308.0 600.9,308.0 H535.7 Z" fill="#2a78d6"><title>1 request after a 260K prompt: ours 131.5, Merlin 114.9 (1.14×)</title></path>
+<text x="426" y="303.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">1 request after a 260K prompt</text>
+<text x="614.9" y="303.0" text-anchor="start" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">1.14×</text>
+<path d="M535.7,328.0 H582.5 Q586.5,328.0 586.5,332.0 V344.0 Q586.5,348.0 582.5,348.0 H535.7 Z" fill="#2a78d6"><title>8 agents at once (halt95's test): ours 792.6, Merlin 716.5 (1.11×)</title></path>
+<text x="426" y="343.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">8 agents at once (halt95's test)</text>
+<text x="596.5" y="343.0" text-anchor="start" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">1.11×</text>
+<path d="M535.7,368.0 H585.8 Q589.8,368.0 589.8,372.0 V384.0 Q589.8,388.0 585.8,388.0 H535.7 Z" fill="#2a78d6"><title>Prefill, 50K prompt: ours 8,256.0, Merlin 7,418.0 (1.11×)</title></path>
+<text x="426" y="383.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">Prefill, 50K prompt</text>
+<text x="599.8" y="383.0" text-anchor="start" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">1.11×</text>
+<path d="M535.7,408.0 H581.9 Q585.9,408.0 585.9,412.0 V424.0 Q585.9,428.0 581.9,428.0 H535.7 Z" fill="#2a78d6"><title>Prefill, 260K prompt: ours 7,737.0, Merlin 7,003.0 (1.10×)</title></path>
+<text x="426" y="423.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">Prefill, 260K prompt</text>
+<text x="595.9" y="423.0" text-anchor="start" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">1.10×</text>
+<path d="M535.7,448.0 H507.5 Q503.5,448.0 503.5,452.0 V464.0 Q503.5,468.0 507.5,468.0 H535.7 Z" fill="#e34948"><title>1 request, thinking on, 4K (halt95's test): ours 170.6, Merlin 182.9 (0.93×)</title></path>
+<text x="426" y="463.0" text-anchor="end" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" fill="#52514e">1 request, thinking on, 4K (halt95's test)</text>
+<text x="545.7" y="463.0" text-anchor="start" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="15" font-weight="600" fill="#0b0b0b">0.93×</text>
+<text x="775" y="526" text-anchor="middle" font-family='system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif' font-size="13" fill="#898781">ours ÷ Merlin 3.0.0 (tok/s)</text>
+</svg>

@@ -197,8 +197,36 @@ INT8 activations cost a little on code perplexity and nothing measurable on the 
 </picture>
 
 Generation figures are short prompts with thinking off, summed over all requests. Power settings changed along the way
-(the unlock arrived at the INT8 step), so the chart shows the order of the work rather than a clean ablation. A
-same-day comparison with halt95's current Merlin 3.0.0 on this machine follows in a separate post.
+(the unlock arrived at the INT8 step), so the chart shows the order of the work rather than a clean ablation.
+
+## Against halt95's latest: Merlin 3.0.0
+
+We ran halt95's current release next to ours on the same machine on the same day, with the same settings and the same
+benchmarks, using its own launcher for this checkpoint (MTP K=3, FP8 KV, 8 requests at once, no RAM tier).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/vs-merlin-swarm-dark.svg">
+  <img src="assets/vs-merlin-swarm-light.svg" alt="40-agent swarm, turns per minute: flash-next-swarm-quad3090 26.5, Merlin 3.0.0 4.2" width="100%">
+</picture>
+
+The swarm is where the design difference shows. Merlin's 925K-token pool holds a few of the forty conversations, so
+it recomputes 99% of every prompt and requests wait 425 s for a slot; with the RAM tier we recompute 4% and wait 52 s.
+That is 26.5 turns per minute against 4.2. It is also a workload Merlin does not claim to serve: its own bench card
+measures eight agents with 16K conversations.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/vs-merlin-dark.svg">
+  <img src="assets/vs-merlin-light.svg" alt="Ours relative to Merlin 3.0.0: 16 requests 2.02x, 1 request short prompt 1.92x, 8 requests 1.30x, 8 at 80K 1.22x, 1 after 260K 1.14x, 8 agents 1.11x, prefill 50K 1.11x, prefill 260K 1.10x, 1 request thinking on at 4K 0.93x" width="100%">
+</picture>
+
+On the smaller tests the gap is 10-30% for prefill and long-context decode, and about 2× at 16 requests, where Merlin's
+8-request limit makes the rest queue. On halt95's own tests, which we re-implemented from his bench card, our box
+reproduces his published Merlin numbers (2 agents: 223.7 tok/s here, 223.9 on his card), and ours is 11-56% ahead with
+2-8 agents. Merlin wins one cell: a single request with thinking on at a 4K prompt, by 7%. Quality is the same:
+HumanEval 161/164 for both, MMLU-Pro 236 against 237 out of 280.
+
+The full table, with its caveats, is in the [README](https://github.com/ththeod/flash-next-swarm-quad3090#compared-with-merlin-300).
+Both builds ran with the unlock here; stock-card numbers, the way halt95 publishes Merlin, follow.
 
 ## What did not work
 
